@@ -21454,7 +21454,7 @@ class ProjectionUpdater:
 
                 # ---- Logo + options ----
                 # Use whichever path you prefer; continue if not found
-                logo_path = r"D:\Goal Planning Files 1\1-Finance-Logo_Final_1.png"
+                logo_path = r"1-Finance-Logo_Final_1.png"
                 if not os.path.exists(logo_path):
                     st.info(f"Logo not found at: {os.path.abspath(logo_path)}. Proceeding without logo.")
                     logo_path = ""  # PDF code checks os.path.exists before adding
@@ -22606,4 +22606,5 @@ if user_id:
         st.error("Please enter a valid user code.")      
 
 else:
+
     st.error("Please enter a valid user code.")          
