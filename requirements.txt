@@ -1,0 +1,12 @@
+streamlit
+pandas
+SQLAlchemy
+psycopg2-binary
+plotly
+fpdf2
+kaleido
+python-dateutil
+xlsxwriter
+openpyxl  
+selenium 
+webdriver-manager
