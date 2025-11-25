@@ -33,6 +33,14 @@ from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 
+chrome_options = Options()
+chrome_options.add_argument("--headless")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--window-size=1200x1000")
+
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
 def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="plotly2img"):
     """Render a Plotly figure to PNG bytes using headless Chrome (no kaleido)."""
@@ -22608,3 +22616,4 @@ if user_id:
 else:
 
     st.error("Please enter a valid user code.")          
+
