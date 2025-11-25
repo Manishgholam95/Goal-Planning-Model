@@ -28,3 +28,4 @@ COPY . .
 
 # Run your script
 CMD ["python", "combine_code_milestone_frontend_25.01.2025.py"]
+
