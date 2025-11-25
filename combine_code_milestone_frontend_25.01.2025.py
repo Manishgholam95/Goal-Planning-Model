@@ -80,7 +80,7 @@ driver = webdriver.Chrome(service=service, options=chrome_options)
 #driver = webdriver.Chrome(options=chrome_options)
 
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
-def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="plotly2img"):
+def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="plotly2img"):
     """Render a Plotly figure to PNG bytes using headless Chrome (no kaleido)."""
     # Use figure layout sizes if present; fall back to generous defaults
     fig_w = int(getattr(fig.layout, "width", 1100) or 1100)
@@ -115,6 +115,8 @@ def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="pl
     driver = webdriver.Chrome(service=service, options=chrome_opts)
     try:
         driver.get("file://" + html_path)
+		
+		time.sleep(2)  # Give time for JS to load and render
 
         # Wait for plot to render
         deadline = time.time() + timeout
@@ -22658,6 +22660,7 @@ if user_id:
 else:
 
     st.error("Please enter a valid user code.")          
+
 
 
 
