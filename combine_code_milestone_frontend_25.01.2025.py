@@ -33,17 +33,18 @@ from selenium.webdriver.common.by import By
 #from webdriver_manager.chrome import ChromeDriverManager
 #from selenium.webdriver.chrome.service import Service
 
-chrome_options = Options()
-chrome_options.binary_location = "/usr/bin/chromium"
-chrome_options.add_argument("--headless=new")
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--disable-gpu")
-chrome_options.add_argument("--window-size=1920,1080")
+#chrome_options = Options()
+options = webdriver.ChromeOptions()
+options.binary_location = "/usr/bin/chromium"
+options.add_argument("--headless=new")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+options.add_argument("--disable-gpu")
+options.add_argument("--window-size=1920,1080")
 
 
 #driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-driver = webdriver.Chrome(options=chrome_options)
+driver = webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
 
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
 def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="plotly2img"):
@@ -22620,6 +22621,7 @@ if user_id:
 else:
 
     st.error("Please enter a valid user code.")          
+
 
 
 
