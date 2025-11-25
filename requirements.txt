@@ -9,6 +9,5 @@ python-dateutil
 xlsxwriter
 openpyxl
 selenium
-webdriver-manager
-chromedriver-autoinstaller
 uvicorn[standard]
+

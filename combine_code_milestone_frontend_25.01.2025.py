@@ -27,9 +27,9 @@ import tempfile
 import time
 import plotly.io as pio
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
+#from selenium import webdriver
+#from selenium.webdriver.chrome.options import Options
+#from selenium.webdriver.common.by import By
 #from webdriver_manager.chrome import ChromeDriverManager
 #from selenium.webdriver.chrome.service import Service
 
@@ -45,6 +45,39 @@ options.add_argument("--window-size=1920,1080")
 
 #driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
 driver = webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
+#chrome_options.binary_location = "/usr/bin/chromium"
+#chrome_options.add_argument("--headless=new")
+#chrome_options.add_argument("--no-sandbox")
+#chrome_options.add_argument("--disable-dev-shm-usage")
+#chrome_options.add_argument("--disable-gpu")
+#chrome_options.add_argument("--window-size=1920,1080")
+
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+#from selenium.webdriver.chrome.service import Service
+
+#from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+
+
+chrome_options = Options()
+chrome_options.binary_location = "/usr/bin/chromium"
+chrome_options.add_argument("--headless=new")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--disable-gpu")
+
+# IMPORTANT: explicitly pass chromedriver path
+service = Service("/usr/bin/chromedriver")
+
+driver = webdriver.Chrome(service=service, options=chrome_options)
+
+
+
+
+#driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+#driver = webdriver.Chrome(options=chrome_options)
 
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
 def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="plotly2img"):
@@ -77,7 +110,8 @@ def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="pl
     # Sharper PNG (higher DPI)
     chrome_opts.add_argument("--force-device-scale-factor=2")
 
-    service = Service(ChromeDriverManager().install())
+    #service = Service(ChromeDriverManager().install())
+    service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=chrome_opts)
     try:
         driver.get("file://" + html_path)
@@ -133,8 +167,11 @@ def html_to_png_via_selenium(html: str, width=1400, height=900, timeout=10, node
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--no-sandbox")
+    chrome_opts.binary_location = "/usr/bin/chromium"
 
-    service = Service(ChromeDriverManager().install())
+
+    #service = Service(ChromeDriverManager().install())
+    service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=opts)
     try:
         driver.get("file://" + html_path)
