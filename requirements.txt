@@ -10,3 +10,4 @@ xlsxwriter
 openpyxl  
 selenium 
 webdriver-manager
+chromedriver-autoinstaller
