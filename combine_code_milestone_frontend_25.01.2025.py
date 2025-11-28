@@ -82,15 +82,14 @@ driver = webdriver.Chrome(service=service, options=chrome_options)
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
 def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="plotly2img"):
     """Render a Plotly figure to PNG bytes using headless Chrome (no kaleido)."""
-    # Use figure layout sizes if present; fall back to generous defaults
     fig_w = int(getattr(fig.layout, "width", 1100) or 1100)
     fig_h = int(getattr(fig.layout, "height", 900) or 900)
 
-    # Allow explicit overrides
-    if width is None:  width = fig_w
-    if height is None: height = fig_h
+    if width is None:
+        width = fig_w
+    if height is None:
+        height = fig_h
 
-    # Add safety margin so nothing is clipped
     win_w = width + 240
     win_h = height + 280
 
@@ -101,24 +100,19 @@ def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="pl
         html_path = f.name
 
     chrome_opts = Options()
-    # If your Chrome is older, swap to "--headless"
     chrome_opts.add_argument("--headless=new")
     chrome_opts.add_argument(f"--window-size={win_w},{win_h}")
     chrome_opts.add_argument("--disable-gpu")
     chrome_opts.add_argument("--disable-dev-shm-usage")
     chrome_opts.add_argument("--no-sandbox")
-    # Sharper PNG (higher DPI)
     chrome_opts.add_argument("--force-device-scale-factor=2")
 
-    #service = Service(ChromeDriverManager().install())
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=chrome_opts)
     try:
         driver.get("file://" + html_path)
-		
-		time.sleep(2)  # Give time for JS to load and render
+        time.sleep(2)  # Allow JS to render
 
-        # Wait for plot to render
         deadline = time.time() + timeout
         elem = None
         while time.time() < deadline:
@@ -132,11 +126,9 @@ def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="pl
         if not elem:
             raise RuntimeError("Plotly figure did not render in time for screenshot.")
 
-        # Make sure it's fully in view
         driver.execute_script("arguments[0].scrollIntoView(true);", elem)
         time.sleep(0.2)
 
-        # If the element is larger than the viewport, enlarge the window again
         rect = driver.execute_script(
             "var r = arguments[0].getBoundingClientRect(); return {w: Math.ceil(r.width), h: Math.ceil(r.height)};",
             elem
@@ -22660,6 +22652,7 @@ if user_id:
 else:
 
     st.error("Please enter a valid user code.")          
+
 
 
 
