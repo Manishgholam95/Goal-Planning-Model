@@ -15,6 +15,12 @@ from plotly.io import write_image  # Ensure this import is present for image sav
 from dateutil.relativedelta import relativedelta
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from streamlit.runtime.state.session_state import SessionState
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+#from selenium.webdriver.chrome.service import Service
+
+#from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
 # import warnings
 # warnings.filterwarnings(
 #     "ignore",
@@ -53,12 +59,7 @@ driver = webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=opti
 #chrome_options.add_argument("--window-size=1920,1080")
 
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-#from selenium.webdriver.chrome.service import Service
 
-#from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.service import Service
 
 
 chrome_options = Options()
@@ -22652,6 +22653,7 @@ if user_id:
 else:
 
     st.error("Please enter a valid user code.")          
+
 
 
 
