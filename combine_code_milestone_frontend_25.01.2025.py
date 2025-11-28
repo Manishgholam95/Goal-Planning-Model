@@ -21,6 +21,9 @@ from selenium.webdriver.chrome.options import Options
 
 #from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 # import warnings
 # warnings.filterwarnings(
 #     "ignore",
@@ -82,14 +85,21 @@ driver = webdriver.Chrome(service=service, options=chrome_options)
 
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
 def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="plotly2img"):
-    """Render a Plotly figure to PNG bytes using headless Chrome (no kaleido)."""
+    """
+    Render a Plotly figure to PNG using Selenium with ChromeDriver (no Kaleido).
+    Now uses WebDriverWait to avoid rendering timeouts.
+    """
+
+    fig.update_layout(
+        margin=dict(l=20, r=20, t=30, b=20),
+        modebar=dict(remove=["toImage", "zoom", "pan"]),
+    )
+
     fig_w = int(getattr(fig.layout, "width", 1100) or 1100)
     fig_h = int(getattr(fig.layout, "height", 900) or 900)
 
-    if width is None:
-        width = fig_w
-    if height is None:
-        height = fig_h
+    if width is None: width = fig_w
+    if height is None: height = fig_h
 
     win_w = width + 240
     win_h = height + 280
@@ -108,39 +118,33 @@ def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="pl
     chrome_opts.add_argument("--no-sandbox")
     chrome_opts.add_argument("--force-device-scale-factor=2")
 
-    service = Service("/usr/bin/chromedriver")
+    service = Service("/usr/bin/chromedriver")  # Or wherever it's installed
     driver = webdriver.Chrome(service=service, options=chrome_opts)
+
     try:
         driver.get("file://" + html_path)
-        time.sleep(2)  # Allow JS to render
 
-        deadline = time.time() + timeout
-        elem = None
-        while time.time() < deadline:
-            try:
-                elem = driver.find_element(By.ID, div_id)
-                if elem.size.get("height", 0) > 0 and elem.size.get("width", 0) > 0:
-                    break
-            except Exception:
-                pass
-            time.sleep(0.2)
-        if not elem:
-            raise RuntimeError("Plotly figure did not render in time for screenshot.")
+        # ✅ Use WebDriverWait instead of time.sleep()
+        wait = WebDriverWait(driver, timeout)
+        elem = wait.until(EC.presence_of_element_located((By.ID, div_id)))
 
         driver.execute_script("arguments[0].scrollIntoView(true);", elem)
-        time.sleep(0.2)
+        time.sleep(0.5)  # tiny buffer to settle layout
 
-        rect = driver.execute_script(
-            "var r = arguments[0].getBoundingClientRect(); return {w: Math.ceil(r.width), h: Math.ceil(r.height)};",
-            elem
-        )
+        # Check bounding box
+        rect = driver.execute_script("""
+            var r = arguments[0].getBoundingClientRect();
+            return {w: Math.ceil(r.width), h: Math.ceil(r.height)};
+        """, elem)
+
         need_w = max(win_w, rect["w"] + 80)
         need_h = max(win_h, rect["h"] + 160)
         if need_w != win_w or need_h != win_h:
             driver.set_window_size(need_w, need_h)
-            time.sleep(0.2)
+            time.sleep(0.5)
 
         return elem.screenshot_as_png
+
     finally:
         driver.quit()
         try:
@@ -22653,6 +22657,7 @@ if user_id:
 else:
 
     st.error("Please enter a valid user code.")          
+
 
 
 
