@@ -83,74 +83,90 @@ driver = webdriver.Chrome(service=service, options=chrome_options)
 #driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
 #driver = webdriver.Chrome(options=chrome_options)
 
+
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
 def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="plotly2img"):
     """
-    Render a Plotly figure to PNG using Selenium with ChromeDriver (no Kaleido).
-    Now uses WebDriverWait to avoid rendering timeouts.
+    Render a Plotly figure to PNG using Selenium (no Kaleido).
+    Includes:
+      ✓ Modebar removal
+      ✓ DPI scaling
+      ✓ Bounding-box resizing
+      ✓ Stable export for all PDF pages
     """
 
+    # Clean layout
     fig.update_layout(
-        margin=dict(l=20, r=20, t=30, b=20),
-        modebar=dict(remove=["toImage", "zoom", "pan"]),
+        margin=dict(l=40, r=40, t=50, b=40),
+        showlegend=True
     )
 
-    fig_w = int(getattr(fig.layout, "width", 1100) or 1100)
-    fig_h = int(getattr(fig.layout, "height", 900) or 900)
+    # Disable modebar completely
+    html = pio.to_html(
+        fig,
+        include_plotlyjs=True,
+        full_html=True,
+        div_id=div_id,
+        config={"displayModeBar": False}   # 🔥 removes zoom/pan/camera toolbar
+    )
 
+    # Fallback defaults
+    fig_w = int(getattr(fig.layout, "width", 1400) or 1400)
+    fig_h = int(getattr(fig.layout, "height", 850) or 850)
     if width is None: width = fig_w
     if height is None: height = fig_h
 
+    # Browser window larger than figure
     win_w = width + 240
-    win_h = height + 280
+    win_h = height + 260
 
-    html = pio.to_html(fig, include_plotlyjs=True, full_html=True, div_id=div_id)
-
+    # Save HTML
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
         f.write(html)
         html_path = f.name
 
+    # Chrome options
     chrome_opts = Options()
     chrome_opts.add_argument("--headless=new")
     chrome_opts.add_argument(f"--window-size={win_w},{win_h}")
     chrome_opts.add_argument("--disable-gpu")
-    chrome_opts.add_argument("--disable-dev-shm-usage")
     chrome_opts.add_argument("--no-sandbox")
-    chrome_opts.add_argument("--force-device-scale-factor=2")
+    chrome_opts.add_argument("--disable-dev-shm-usage")
+    chrome_opts.add_argument("--force-device-scale-factor=2")   # 🔥 Retina-quality PNG
 
-    service = Service("/usr/bin/chromedriver")  # Or wherever it's installed
+    service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=chrome_opts)
 
     try:
         driver.get("file://" + html_path)
 
-        # ✅ Use WebDriverWait instead of time.sleep()
+        # Wait until plot div is ready
         wait = WebDriverWait(driver, timeout)
         elem = wait.until(EC.presence_of_element_located((By.ID, div_id)))
 
         driver.execute_script("arguments[0].scrollIntoView(true);", elem)
-        time.sleep(0.5)  # tiny buffer to settle layout
+        time.sleep(0.5)
 
-        # Check bounding box
+        # 🔥 IMPORTANT — BOUNDING BOX CORRECTION
         rect = driver.execute_script("""
             var r = arguments[0].getBoundingClientRect();
             return {w: Math.ceil(r.width), h: Math.ceil(r.height)};
         """, elem)
 
-        need_w = max(win_w, rect["w"] + 80)
-        need_h = max(win_h, rect["h"] + 160)
+        need_w = max(win_w, rect["w"] + 100)
+        need_h = max(win_h, rect["h"] + 180)
+
         if need_w != win_w or need_h != win_h:
             driver.set_window_size(need_w, need_h)
             time.sleep(0.5)
 
+        # Finally capture screenshot
         return elem.screenshot_as_png
 
     finally:
         driver.quit()
-        try:
-            os.remove(html_path)
-        except Exception:
-            pass
+        try: os.remove(html_path)
+        except: pass
 
 
 
@@ -166,11 +182,8 @@ def html_to_png_via_selenium(html: str, width=1400, height=900, timeout=10, node
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--no-sandbox")
-    chrome_opts.binary_location = "/usr/bin/chromium"
 
-
-    #service = Service(ChromeDriverManager().install())
-    service = Service("/usr/bin/chromedriver")
+    service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=opts)
     try:
         driver.get("file://" + html_path)
@@ -338,6 +351,62 @@ class ProjectionUpdater:
         rows = cursor.fetchall()
         cursor.close()
         return {row[0]: row[1] for row in rows}
+        
+    
+    def initialize_user_if_first_time(self, user_id):
+        """
+        Run copy functions only once for each user_id.
+        """
+        cursor = self.connection.cursor()
+
+        # 1. Check if user_id exists in tracker
+        cursor.execute("""
+            SELECT initialized 
+            FROM user_initialization_tracker 
+            WHERE user_id = %s;
+        """, (user_id,))
+        result = cursor.fetchone()
+
+        # -----------------------------
+        # CASE 1: FIRST TIME USER
+        # -----------------------------
+        if result is None:
+            st.info(f"Running first-time setup for user: {user_id}")
+
+            # Create tracker entry
+            cursor.execute("""
+                INSERT INTO user_initialization_tracker (user_id, initialized)
+                VALUES (%s, FALSE);
+            """, (user_id,))
+            self.connection.commit()
+
+            # Execute your one-time functions
+            self.copy_customer_profile_to_milestone_customer_profile(user_id)
+            self.copy_life_stage_growth_to_milestone(user_id)
+            self.copy_income_to_milestone_income(user_id)
+            self.copy_customer_details_to_milestone_customer_details(user_id)
+            self.copy_expenses_to_milestone_expenses(user_id)
+            self.copy_assets_to_assets_milestones(user_id)
+            self.copy_liabilities_to_liabilities_milestones(user_id)
+            
+
+            # Mark as initialized
+            cursor.execute("""
+                UPDATE user_initialization_tracker
+                SET initialized = TRUE
+                WHERE user_id = %s;
+            """, (user_id,))
+            self.connection.commit()
+
+            st.success("First-time initialization completed successfully.")
+
+        # -----------------------------
+        # CASE 2: USER ALREADY INITIALIZED
+        # -----------------------------
+        else:
+            st.warning("User already initialized. Copy functions skipped.")
+
+        cursor.close()
 
     
     # New Functionality for Milestones Liabilities
@@ -969,6 +1038,24 @@ class ProjectionUpdater:
             df.drop_duplicates(subset=['user_code','category_id','entry_date'], keep='last', inplace=True)
 
         return df
+
+    def fetch_milestone_sort_order(self, user_id):
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            SELECT TRIM(purpose) AS milestone_name, milestone_year
+            FROM milestones_liabilities
+            WHERE user_code = %s
+            AND purpose IS NOT NULL
+            AND purpose <> 'None'
+            ORDER BY milestone_year ASC;
+        """, (user_id,))
+
+        rows = cursor.fetchall()
+        cursor.close()
+
+        # Return milestone_name in sorted order
+        return [name for name, _ in rows]   
+     
     
     def delete_milestone_from_milestone_calculation_projections(self, milestone_calculation_projections_df, user_id, milestone_name):
         """Remove all rows for (user_id, milestone_name) from the projections DF."""
@@ -1125,6 +1212,18 @@ class ProjectionUpdater:
 
         # Reset the index to bring milestone_name as a column for better readability
         reshaped_df = reshaped_df.reset_index()
+
+        milestone_sort_order = self.fetch_milestone_sort_order(user_id)
+
+        # Convert milestone_name to ordered categorical
+        reshaped_df['milestone_name'] = pd.Categorical(
+            reshaped_df['milestone_name'],
+            categories=milestone_sort_order,
+            ordered=True
+        )
+
+        # Apply sort
+        reshaped_df = reshaped_df.sort_values('milestone_name')
         
         return reshaped_df
     
@@ -1158,8 +1257,21 @@ class ProjectionUpdater:
             fill_value=0
         ).reset_index()
 
-        # Show milestone_name as index (like before)
-        reshaped_df.set_index('milestone_name', inplace=True)
+         # ✔ STEP: GET SORT ORDER FROM milestones_liabilities
+        milestone_sort_order = self.fetch_milestone_sort_order(user_id)
+
+        # ✔ Apply custom order using Categorical
+        reshaped_df['milestone_name'] = pd.Categorical(
+            reshaped_df['milestone_name'],
+            categories=milestone_sort_order,
+            ordered=True
+        )
+
+        reshaped_df = reshaped_df.sort_values("milestone_name")
+
+        # Make milestone_name index again
+        reshaped_df.set_index("milestone_name", inplace=True)
+
         return reshaped_df
 
 
@@ -1210,7 +1322,7 @@ class ProjectionUpdater:
             # Fetch all rows for this user from customer_profile
             cursor.execute("""
                 SELECT
-                    id, user_code, first_name, last_name, dob, gender, mobile_number, email, city, state, country, money_sign,
+                    id, user_code, first_name, last_name, dob, gender, email, city, state, country, money_sign,
                     marital_status, created_at, updated_at, education, retirement_age, member_id, pan_no, pan_name,
                     is_active, email_verified, ms_completed_date
                 FROM customer_profile
@@ -1227,11 +1339,11 @@ class ProjectionUpdater:
             # Insert into milestone_customer_profile with explicit column list
             insert_sql = """
                 INSERT INTO milestone_customer_profile (
-                    id, user_code, first_name, last_name, dob, gender, mobile_number, email, city, state, country,
+                    id, user_code, first_name, last_name, dob, gender, email, city, state, country,
                     money_sign, marital_status, created_at, updated_at, education, retirement_age, member_id, pan_no, pan_name,
                     is_active, email_verified, ms_completed_date
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
             """
@@ -1473,166 +1585,130 @@ class ProjectionUpdater:
 
 
     def manage_life_stage_growth_milestone(self, user_id):
-        st.header("Manage Life Stage Growth Milestone")
-
-        # ======================================================
-        # 1️⃣ INSERT — create 4 rows for this user
-        # ======================================================
-        st.subheader("Insert New life_stage_growth_milestone Records")
-        do_insert = st.radio(
-            "Do you want to insert records?",
-            ["No", "Yes"],
-            index=0,
-            key="lsgm_insert_radio"
-        )
-
-        if do_insert == "Yes":
-            if not user_id:
-                st.error("Please enter a valid user_code above before inserting.")
-            else:
-                st.info("Enter growth_rate values for each life stage:")
-
-                # USER INPUT FOR 4 growth rates
-                growth_239 = st.number_input("Growth Rate (for 26-35)", key="lsgm_gr_239")/100
-                growth_240 = st.number_input("Growth Rate (for 36-45)", key="lsgm_gr_240")/100
-                growth_241 = st.number_input("Growth Rate (for 46-55)", key="lsgm_gr_241")/100
-                growth_242 = st.number_input("Growth Rate (for 56-65)", key="lsgm_gr_242")/100
-
-                growth_map = {
-                    239: growth_239,
-                    240: growth_240,
-                    241: growth_241,
-                    242: growth_242,
-                }
-
-                # FIXED values from your screenshot
-                min_age_map = {239: 26, 240: 36, 241: 46, 242: 56}
-                max_age_map = {239: 35, 240: 45, 241: 55, 242: 60}
-                name_map = {
-                    239: "Building",
-                    240: "Growth",
-                    241: "Sustainability",
-                    242: "Pre-Retirement"
-                }
-
-                if st.button("Insert 4 Growth Records", key="lsgm_insert_btn"):
-                    try:
-                        with self.connection.cursor() as cursor:
-
-                            insert_sql = """
-                                INSERT INTO life_stage_growth_milestone (
-                                    user_code, category_id, min_age_range, max_age_range,
-                                    growth_rate, name, is_active, created_at, updated_at
-                                ) VALUES (
-                                    %s, %s, %s, %s, %s, %s, True, NOW(), NOW()
-                                )
-                            """
-
-                            for cid in [239, 240, 241, 242]:
-                                cursor.execute(
-                                    insert_sql,
-                                    (
-                                        str(user_id),
-                                        cid,
-                                        min_age_map[cid],
-                                        max_age_map[cid],
-                                        growth_map[cid],
-                                        name_map[cid],
-                                    )
-                                )
-
-                            self.connection.commit()
-                            st.success("Successfully inserted 4 milestone growth records!")
-
-                    except Exception as e:
-                        self.connection.rollback()
-                        st.error(f"Error inserting milestone records: {e}")
-
-        # ======================================================
-        # 2️⃣ UPDATE — update growth_rate for each category
-        # ======================================================
         st.subheader("Update Existing life_stage_growth_milestone Records")
-        do_update = st.radio(
-            "Do you want to update growth rate values?",
-            ["No", "Yes"],
-            index=0,
-            key="lsgm_update_radio"
-        )
+        do_update = st.radio( "Do you want to update growth rate values?", ["No", "Yes"], index=0, key="lsgm_update_radio")
 
         if do_update == "Yes":
-            if not user_id:
-                st.error("Please enter a valid user_code above before updating.")
-            else:
-                st.info("Enter NEW growth_rate values for each category:")
+            try:
+                if not user_id:
+                    st.error("Please enter a valid user_code above before updating.")
+                else:
+                    st.info("Enter NEW growth_rate values for each category:")
+                    
+                    # Same/New controls per category
+                    update_options = {
+                        "cat_239": st.selectbox("Growth Rate (26-35)", ["Same", "New"], key="mi_update_cat239_option"),
+                        "cat_240": st.selectbox("Growth Rate (36-45)", ["Same", "New"], key="mi_update_cat240_option"),
+                        "cat_241": st.selectbox("Growth Rate (46-55)", ["Same", "New"], key="mi_update_cat241_option"),
+                        "cat_242": st.selectbox("Growth Rate (56-65)", ["Same", "New"], key="mi_update_cat242_option"),
+                    }
+                    
+                    updates = {}
+                    if update_options["cat_239"] == "New":
+                        updates["cat_239"] = st.number_input( "New Growth Rate (26-35)", value=0.0, key="mi_update_cat239_amount")/100
+                        
+                    if update_options["cat_240"] == "New":
+                        updates["cat_240"] = st.number_input( "New Growth Rate (36-45)", value=0.0, key="mi_update_cat240_amount")/100	
+                        
+                    if update_options["cat_241"] == "New":
+                        updates["cat_241"] = st.number_input( "New Growth Rate (46-55)", value=0.0, key="mi_update_cat241_amount")/100		
 
-                new_239 = st.number_input("New Growth Rate (26-35)", key="lsgm_upd_239")/100
-                new_240 = st.number_input("New Growth Rate (36-45)", key="lsgm_upd_240")/100
-                new_241 = st.number_input("New Growth Rate (46-55)", key="lsgm_upd_241")/100
-                new_242 = st.number_input("New Growth Rate (56-65)", key="lsgm_upd_242")/100
-
-                update_map = {
-                    239: new_239,
-                    240: new_240,
-                    241: new_241,
-                    242: new_242,
-                }
-
-                if st.button("Update Growth Rates", key="lsgm_update_btn"):
-                    try:
-                        with self.connection.cursor() as cursor:
-                            update_sql = """
-                                UPDATE life_stage_growth_milestone
-                                SET growth_rate = %s, updated_at = NOW()
-                                WHERE user_code = %s AND category_id = %s;
-                            """
-
-                            for category_id, growth_rate in update_map.items():
-                                cursor.execute(update_sql, (growth_rate, str(user_id), category_id))
-
-                            self.connection.commit()
-                            st.success("Growth rate values updated successfully!")
-
-                    except Exception as e:
-                        self.connection.rollback()
-                        st.error(f"Error updating growth rates: {e}")
-
-        # ======================================================
-        # 3️⃣ DELETE — remove all rows for this user
-        # ======================================================
-        st.subheader("Delete life_stage_growth_milestone Records")
-        do_delete = st.radio(
-            "Do you want to delete all records for this user?",
-            ["No", "Yes"],
-            index=0,
-            key="lsgm_delete_radio"
-        )
-
-        if do_delete == "Yes":
-            if not user_id:
-                st.error("Please enter a valid user_code above before deleting.")
-            else:
-                if st.button("Delete All Growth Records", key="lsgm_delete_btn"):
-                    try:
-                        with self.connection.cursor() as cursor:
-                            cursor.execute("""
-                                DELETE FROM life_stage_growth_milestone
-                                WHERE user_code = %s;
-                            """, (str(user_id),))
-
-                            self.connection.commit()
-
-                            if cursor.rowcount > 0:
-                                st.success("All growth milestone records deleted successfully!")
+                    if update_options["cat_242"] == "New":
+                        updates["cat_242"] = st.number_input( "New Growth Rate (56-65)", value=0.0, key="mi_update_cat242_amount")/100
+                        
+                    if st.button("Update Growth Rate", key="mi_update_growth_rate_1"):
+                            if not updates:
+                                st.info("No changes selected (both set to Same). Nothing to update.")
                             else:
-                                st.warning("No records found for this user.")
+                                try:
+                                    msgs = []
+                                    with self.connection.cursor() as cursor:
+                                        # Separate update for category_id = 239
+                                        if "cat_239" in updates:
+                                            cursor.execute(
+                                                """
+                                                UPDATE life_stage_growth_milestone
+                                                SET growth_rate = %s,
+                                                    updated_at = NOW()
+                                                WHERE user_code = %s
+                                                AND category_id = 239
+                                                AND is_active = TRUE;
+                                                """,
+                                                (float(updates["cat_239"]), str(user_id)),
+                                            )
+                                            if cursor.rowcount > 0:
+                                                msgs.append("Updated the growth rate (26-35)")
+                                            else:
+                                                msgs.append("No row to update growth rate (26-35)")
 
-                    except Exception as e:
-                        self.connection.rollback()
-                        st.error(f"Error deleting records: {e}")
+                                        # Separate update for category_id = 240
+                                        if "cat_240" in updates:
+                                            cursor.execute(
+                                                """
+                                                UPDATE life_stage_growth_milestone
+                                                SET growth_rate = %s,
+                                                    updated_at = NOW()
+                                                WHERE user_code = %s
+                                                AND category_id = 240
+                                                AND is_active = TRUE;
+                                                """,
+                                                (float(updates["cat_240"]), str(user_id)),
+                                            )
+                                            if cursor.rowcount > 0:
+                                                msgs.append("Updated the growth rate (36-45)")
+                                            else:
+                                                msgs.append("No row to update growth rate (36-45)")
+                                                
+                                                
+                                        # Separate update for category_id = 241
+                                        if "cat_241" in updates:
+                                            cursor.execute(
+                                                """
+                                                UPDATE life_stage_growth_milestone
+                                                SET growth_rate = %s,
+                                                    updated_at = NOW()
+                                                WHERE user_code = %s
+                                                AND category_id = 241
+                                                AND is_active = TRUE;
+                                                """,
+                                                (float(updates["cat_241"]), str(user_id)),
+                                            )
+                                            if cursor.rowcount > 0:
+                                                msgs.append("Updated the growth rate (46-55)")
+                                            else:
+                                                msgs.append("No row to update growth rate (46-55)")
+                                        
+                                        # Separate update for category_id = 242
+                                        if "cat_242" in updates:
+                                            cursor.execute(
+                                                """
+                                                UPDATE life_stage_growth_milestone
+                                                SET growth_rate = %s,
+                                                    updated_at = NOW()
+                                                WHERE user_code = %s
+                                                AND category_id = 242
+                                                AND is_active = TRUE;
+                                                """,
+                                                (float(updates["cat_242"]), str(user_id)),
+                                            )
+                                            if cursor.rowcount > 0:
+                                                msgs.append("Updated the growth rate (56-65)")
+                                            else:
+                                                msgs.append("No row to update growth rate (56-65)")									
+                                        
+
+                                    self.connection.commit()
+                                    # Show combined result
+                                    if msgs:
+                                        for m in msgs:
+                                            st.success(m)
+                                except Exception as e:
+                                    self.connection.rollback()
+                                    st.error(f"Error updating milestone_income: {e}")
+            except Exception as e:
+                st.error(f"Error setting up update UI: {e}")
         
- 
-
-
+        
     def manage_milestone_income(self):
         # ---------- UPDATE (yearly_amount for category_id 65 and 306) ----------
         st.subheader("Update Existing milestone_income Records")
@@ -11196,7 +11272,7 @@ class ProjectionUpdater:
         cursor.execute(delete_query, (current_date,))
         self.connection.commit()
         cursor.close()
-        print(f"Records with entry_date less than {current_date} have been deleted.")
+        st.write(f"Records with entry_date less than {current_date} have been deleted.")
 
     def copy_withdrawal_values(self, user_id, surplus_withdrawal_projections_df, unique_assets_surplus_projections):
         if st.radio("Do you want to copy the amount directly into the withdrawal table?", ["No", "Yes"], key="copy_withdrawal_choice") == "Yes":
@@ -18071,8 +18147,13 @@ class ProjectionUpdater:
     
         # Find the first valid rolling sum after a full 12-month window
         first_valid_index = rolling_sums_total_expense.first_valid_index()
-        first_total_expense_date = dynamic_yearly_cf_projections_df['entry_date'][first_valid_index]
-        first_total_expense_value = rolling_sums_total_expense[first_valid_index]
+        if first_valid_index is not None:
+            first_total_expense_date = dynamic_yearly_cf_projections_df['entry_date'].iloc[first_valid_index]
+            first_total_expense_value = rolling_sums_total_expense.iloc[first_valid_index]
+        else:
+            # Fallback to the first date and zero value
+            first_total_expense_date = dynamic_yearly_cf_projections_df['entry_date'].iloc[0]
+            first_total_expense_value = 0
 
         fig.add_trace(go.Scatter(
             x=dynamic_yearly_cf_projections_df['entry_date'], 
@@ -21503,7 +21584,7 @@ class ProjectionUpdater:
 
                 # ---- Logo + options ----
                 # Use whichever path you prefer; continue if not found
-                logo_path = r"1-Finance-Logo_Final_1.png"
+                logo_path = r"D:\Goal Planning Files 1\1-Finance-Logo_Final_1.png"
                 if not os.path.exists(logo_path):
                     st.info(f"Logo not found at: {os.path.abspath(logo_path)}. Proceeding without logo.")
                     logo_path = ""  # PDF code checks os.path.exists before adding
@@ -21712,7 +21793,7 @@ class ProjectionUpdater:
         
         investment_reshaped_df = self.reshape_display_investment_projections(investment_projections_df, user_id)
         
-        investment_editable_reshaped_df = st.data_editor(investment_reshaped_df, use_container_width=True, key = 'reshaped_editor_3')
+        investment_editable_reshaped_df = st.data_editor(investment_reshaped_df, use_container_width=True, key = 'Invest_reshaped_editor_3')
 
         # Save changes back to the database
         if st.button("Save Changes", key = 'save transpose investment projection'):
@@ -22183,6 +22264,19 @@ option = st.sidebar.radio(
 
 # Main content based on the sidebar option
 if user_id:
+
+    projection_updater.initialize_user_if_first_time(user_id)
+
+    if st.button("Reset user copy logic"):
+        cursor = projection_updater.connection.cursor()
+        cursor.execute("""
+            DELETE FROM user_initialization_tracker
+            WHERE user_id = %s;
+        """, (user_id,))
+        projection_updater.connection.commit()
+        cursor.close()
+        st.success("Initialization reset! The copy functions will run next time for this user.")
+
     # Fetch user data (DOB, retirement age)
     dob, retirement_age = projection_updater.fetch_user_data(user_id)
 
@@ -22192,80 +22286,39 @@ if user_id:
         manage_input_goal_table = st.radio("Do you want to update the user goal details?", ["No", "Yes"], index=0) 
         if manage_input_goal_table == "Yes":
             #st.write("### Insert, Update and Delete Milestones Liabilities")
-            projection_updater.manage_milestones_liabilities(user_id) 
-
-        st.write('### Copy Customer Profile table (DOB and Retirement Age)')
-        copy_customer_profile_table = st.radio("Do you want to copy the Customer Profile table?", ["No", "Yes"], index=0)
-        if copy_customer_profile_table == "Yes":
-            if st.button('Do you want to copy the customer profile table from EOS',key = 'copy customer profile'):
-                projection_updater.copy_customer_profile_to_milestone_customer_profile(user_id) 
+            projection_updater.manage_milestones_liabilities(user_id)  
 
         st.write("### Changing Milestone Customer Profile (DOB and Retirement Age)")    
         manage_customer_profile_table = st.radio("Do you want to update the milestone customer profile table?", ["No", "Yes"], index=0) 
         if manage_customer_profile_table == "Yes":
             projection_updater.manage_milestone_customer_profile()
 
-        st.write('### Copy life stage growth table')
-        copy_life_stage_growth_table = st.radio("Do you want to copy the life stage growth table?", ["No", "Yes"], index=0)
-        if copy_life_stage_growth_table == "Yes":
-            if st.button('Do you want to copy the life stage growth table?',key = 'copy life stage growth table'):
-                projection_updater.copy_life_stage_growth_to_milestone(user_id)      
 
         st.write("### Changing life stage growth table")    
         manage_income_table = st.radio("Do you want to update the life stage growth table?", ["No", "Yes"], index=0) 
         if manage_income_table == "Yes":
                 projection_updater.manage_life_stage_growth_milestone(user_id)          
-
-
-        st.write('### Copy income table')
-        copy_income_table = st.radio("Do you want to copy the Income table?", ["No", "Yes"], index=0)
-        if copy_income_table == "Yes":
-            if st.button('Do you want to copy the income table from EOS',key = 'copy income table'):
-                projection_updater.copy_income_to_milestone_income(user_id) 
+                 
 
         st.write("### Changing Milestone Income")    
         manage_income_table = st.radio("Do you want to update the milestone income table?", ["No", "Yes"], index=0) 
         if manage_income_table == "Yes":
-            projection_updater.manage_milestone_income()
-
-        st.write('### Copy Customer Details table (Tax Deduction Amount and Non Taxable Income)')
-        copy_customer_details_table = st.radio("Do you want to copy the Customter Details table?", ["No", "Yes"], index=0)
-        if copy_customer_details_table == "Yes":
-            if st.button('Do you want to copy the customer detail table from EOS',key = 'copy customer detail table'):
-                projection_updater.copy_customer_details_to_milestone_customer_details(user_id) 
+            projection_updater.manage_milestone_income() 
 
         st.write("### Changing Customer Details (Tax Deduction Amount and Non Taxable Income)")    
         manage_customer_details_table = st.radio("Do you want to update the customer details table?", ["No", "Yes"], index=0) 
         if manage_customer_details_table == "Yes":
             projection_updater.manage_milestone_customer_details(user_id)
 
-        st.write('### Copy Customer expenses table')
-        copy_milestone_expenses_table = st.radio("Do you want to copy the Customter expenses table?", ["No", "Yes"], index=0)
-        if copy_milestone_expenses_table == "Yes":
-            if st.button('Do you want to copy the customer expense table from EOS',key = 'copy customer expense table'):
-                projection_updater.copy_expenses_to_milestone_expenses(user_id) 
-
         st.write("### Changing user expenses")    
         manage_expenses_table = st.radio("Do you want to update the expense table?", ["No", "Yes"], index=0) 
         if manage_expenses_table == "Yes":
             projection_updater.manage_milestone_expenses(user_id)    
 
-        st.write('### Copy assets table')
-        copy_asset_table = st.radio("Do you want to copy the assets table?", ["No", "Yes"], index=0)
-        if copy_asset_table == "Yes":
-            if st.button('Do you want to copy the asset table from EOS',key = 'copy asset table'):
-                projection_updater.copy_assets_to_assets_milestones(user_id) 
-
         st.write("### Changing Assets Data")    
         manage_asset_table = st.radio("Do you want to update the asset table?", ["No", "Yes"], index=0) 
         if manage_asset_table == "Yes":
-            projection_updater.manage_assets_milestones()    
-
-        st.write('### Copy liability table')
-        copy_liability_table = st.radio("Do you want to copy the liability table?", ["No", "Yes"], index=0)
-        if copy_liability_table == "Yes":
-            if st.button('Do you want to copy the liability table from EOS',key = 'copy liability table'):
-                projection_updater.copy_liabilities_to_liabilities_milestones(user_id)  
+            projection_updater.manage_assets_milestones()     
 
         st.write("### Changing Liabilities Data")
         manage_liability_table = st.radio("Do you want to update the liability table?", ["No", "Yes"], index=0)
@@ -22390,94 +22443,29 @@ if user_id:
         manage_insurance_outflows_projection_table = st.radio("Do you want to update the Insurance Outflows Projection table?", ["No", "Yes"], index=0) 
         if manage_insurance_outflows_projection_table == "Yes":
             if st.button("Update the Insurance Outflows Projection", key = 'all insurance outflows liabilities'):
-                projection_updater.run_dynamic_insurance_outflows_projections(user_id, month_choice)    
-        
-    elif option == "Assets Section":
+                projection_updater.run_dynamic_insurance_outflows_projections(user_id, month_choice)
 
-        st.write("### Changing Investment Projection Data")   
-        manage_investment_table = st.radio("Do you want to update the Investment Projection table?", ["No", "Yes"], index=0) 
-        if manage_investment_table == "Yes":
-            projection_updater.run_investment_projections(user_id, month_choice)    
-
-        st.write("### Running Surplus Withdrawal Projection")
-        manage_surplus_withdrawal_projection_table = st.radio("Do you want to update the surplus withdrawal Projection table?", ["No", "Yes"], index=0) 
-        if manage_surplus_withdrawal_projection_table == "Yes":
-            projection_updater.run_surplus_withdrawal_projections(user_id, month_choice) 
-            
-    
-        st.write("### Changing Assets Projection Data")
-        manage_assets_projection_table = st.radio("Do you want to update the assets Projection table?", ["No", "Yes"], index=0) 
-        if manage_assets_projection_table == "Yes":
-            if st.button("Update the Asset Projection", key = 'all asset outflows liabilities'):
-                projection_updater.run_dynamic_assets_projections(user_id, month_choice)
-
-        
-        st.write("### Add Downpayment Data")
-        manage_down_payment_table = st.radio("Do you want to do downpayment?", ["No", "Yes"], index=0) 
-        if manage_down_payment_table == "Yes":
-                projection_updater.manage_downpayment_outstanding_amount()  
-
-    elif option == "Income Section":    
-
-        st.write("### Changing milestone income projection")  
-        manage_goal_income_table_1 = st.radio("Do you want to update income projection?", ["No", "Yes"], index=0)
-        if manage_goal_income_table_1 == "Yes":
-            update_user_income_table = st.radio("Do you copy and update user income projection?", ["No", "Yes"], index=0)
-            if update_user_income_table == "Yes":
-                st.write("### Changing milestone income projection")
-                projection_updater.run_dynamic_milestone_income_projection(user_id)
-
-            update_user_combine_income_table = st.radio("Do you copy and update user combine income projection?", ["No", "Yes"], index=0)
-            if update_user_combine_income_table == "Yes":
-                st.write("### Changing combine milestone income projection")
-                projection_updater.run_dynamic_combine_milestone_income_projection(user_id)   
-
-        st.write("### Add the Additional Income Expense Category")
-        manage_additional_expense_table = st.radio("Do you want to update additional expense projection?", ["No", "Yes"], index=0)
-        if manage_additional_expense_table == "Yes":
-            projection_updater.run_additional_income_expense_criteria(user_id, month_choice)  
-            
-    elif option == "Cashflow, Actual, Ideal and FBS Projection Data":        
-        st.write("### Changing cashflow, Actual, Ideal and FBS Projection Data")
-        manage_automated_run_projection_table = st.radio("Do you want to update the Summary of all projections, Actual, Ideal and FBS Projection table?", ["No", "Yes"], index=0) 
-        if manage_automated_run_projection_table == "Yes":
-            if st.button("Update the Summary of all projections", key = 'all total of projections'):
-                projection_updater.run_dynamic_yearly_cf_projections(user_id, dob, retirement_age, month_choice) 
-
-            if st.button("Update the User Actual projection", key = 'User Actual projections'):
-                projection_updater.run_actual_projections_with_milestones(user_id, dob, retirement_age, month_choice) 
-
-            manage_ideal_projection_table = st.radio("Do you want to update ideal projection?", ["No", "Yes"], index=0)
-            if manage_ideal_projection_table == "Yes":
-                projection_updater.run_dynamic_ideal_projection_calculation(user_id) 
-
-            if st.button("Update the User Ideal Emergency projection", key = 'User Ideal Emergency projections'):
-                projection_updater.run_ideal_projections_emergency_fund_with_milestones(user_id, dob, retirement_age, month_choice)     
-
-            if st.button("Update the User FBS projection", key = 'User FBS projections'):
-                projection_updater.run_fbs_dynamic_projections_with_milestones(user_id, dob, retirement_age, month_choice)                      
-
-
-        try:
-            investment_df_updated = projection_updater.load_investment_projections_from_db(user_id)
-            if investment_df_updated.empty:
-                st.warning("⚠️ Investment projections not yet calculated for this user.")
-            else:
-                reshaped_investment_df = projection_updater.reshape_display_investment_projections(investment_df_updated, user_id)
-                st.write("### 🟢 Updated Investment Projections")
-                st.dataframe(reshaped_investment_df)
-        except Exception as e:
-            st.error(f"❌ Failed to load Investment Projections: {str(e)}")
-
-    
         try:
             loan_repayment_df_updated = projection_updater.load_dynamic_loan_repayment_projections_from_db(user_id)
             if loan_repayment_df_updated.empty:
                 st.warning("⚠️ Loan repayment projections not yet calculated for this user.")
             else:
-                reshaped_loan_df = projection_updater.reshape_display_loan_repayment_projections(loan_repayment_df_updated, user_id)
-                st.write("### 🟢 Updated Loan Repayment Projections")
-                st.dataframe(reshaped_loan_df)
+                loan_repayment_reshaped_df = projection_updater.reshape_display_loan_repayment_projections(loan_repayment_df_updated, user_id)
+                loan_repayment_editable_reshaped_df = st.data_editor(loan_repayment_reshaped_df, use_container_width=True, key = 'reshaped_editor_4')
+                # Save changes back to the database
+                if st.button("Save Changes", key = 'save transpose loan repayment projection'):
+                    # Unpivot the reshaped DataFrame to its original format
+                    loan_repayment_reshaped_df.reset_index(inplace=True)  # Reset index before unpivoting
+                    loan_repayment_updated_unpivoted_df = projection_updater.liabilities_unpivot_reshaped_data(loan_repayment_editable_reshaped_df)
+
+                    # Update the main DataFrame with new values
+                    dynamic_loan_repayment_projections_df = projection_updater.liabilities_update_main_dataframe(loan_repayment_df_updated, loan_repayment_updated_unpivoted_df)
+
+                    # Save the updated DataFrame to the database
+                    projection_updater.save_dynamic_loan_repayment_projections_to_db(dynamic_loan_repayment_projections_df, user_id)
+
+                    st.success("Changes of loan repayment projection saved successfully!")
+                
         except Exception as e:
             st.error(f"❌ Failed to load Loan Repayment Projections: {str(e)}")
 
@@ -22515,7 +22503,57 @@ if user_id:
                 st.write("### 🟢 Updated Insurance outflows projections")
                 st.dataframe(reshaped_insurance_outflows_df)
         except Exception as e:
-            st.error(f"❌ Failed to load Insurance outflows projections: {str(e)}") 
+            st.error(f"❌ Failed to load Insurance outflows projections: {str(e)}")             
+        
+    elif option == "Assets Section":
+
+        st.write("### Changing Investment Projection Data")   
+        manage_investment_table = st.radio("Do you want to update the Investment Projection table?", ["No", "Yes"], index=0) 
+        if manage_investment_table == "Yes":
+            projection_updater.run_investment_projections(user_id, month_choice)    
+
+        st.write("### Running Surplus Withdrawal Projection")
+        manage_surplus_withdrawal_projection_table = st.radio("Do you want to update the surplus withdrawal Projection table?", ["No", "Yes"], index=0) 
+        if manage_surplus_withdrawal_projection_table == "Yes":
+            projection_updater.run_surplus_withdrawal_projections(user_id, month_choice) 
+            
+    
+        st.write("### Changing Assets Projection Data")
+        manage_assets_projection_table = st.radio("Do you want to update the assets Projection table?", ["No", "Yes"], index=0) 
+        if manage_assets_projection_table == "Yes":
+            if st.button("Update the Asset Projection", key = 'all asset outflows liabilities'):
+                projection_updater.run_dynamic_assets_projections(user_id, month_choice)
+
+        
+        st.write("### Add Downpayment Data")
+        manage_down_payment_table = st.radio("Do you want to do downpayment?", ["No", "Yes"], index=0) 
+        if manage_down_payment_table == "Yes":
+                projection_updater.manage_downpayment_outstanding_amount() 
+
+        try:
+            investment_df_updated = projection_updater.load_investment_projections_from_db(user_id)
+            if investment_df_updated.empty:
+                st.warning("⚠️ Investment projections not yet calculated for this user.")
+            else:
+                investment_reshaped_df = projection_updater.reshape_display_investment_projections(investment_df_updated, user_id)
+                st.write("### 🟢 Updated Investment Projections")
+                investment_editable_reshaped_df = st.data_editor(investment_reshaped_df, use_container_width=True, key = 'reshaped_editor_3')
+
+                # Save changes back to the database
+                if st.button("Save Changes", key = 'save transpose investment projection'):
+                    # Unpivot the reshaped DataFrame to its original format
+                    investment_reshaped_df.reset_index(inplace=True)  # Reset index before unpivoting
+                    investment_updated_unpivoted_df = projection_updater.unpivot_reshaped_data(investment_editable_reshaped_df)
+
+                    # Update the main DataFrame with new values
+                    investment_df_updated = projection_updater.update_main_dataframe(investment_df_updated, investment_updated_unpivoted_df)
+
+                    # Save the updated DataFrame to the database
+                    projection_updater.save_investment_projections_to_db(investment_df_updated, user_id)
+
+            st.success("Changes of investment projection saved successfully!")
+        except Exception as e:
+            st.error(f"❌ Failed to load Investment Projections: {str(e)}")
 
 
         try:
@@ -22524,6 +22562,21 @@ if user_id:
                 st.warning("⚠️ Surplus withdrawal projections not yet calculated for this user.")
             else:
                 reshaped_surplus_withdrawal_df = projection_updater.reshape_display_surplus_related_withdrawal_projections(surplus_withdrawal_projections_df, user_id)
+                withdrawal_editable_reshaped_df = st.data_editor(reshaped_surplus_withdrawal_df, use_container_width=True, key = 'reshaped_editor_4')
+                # Save changes back to the database
+                if st.button("Save Changes", key = 'save transpose surplus projection'):
+                    # Unpivot the reshaped DataFrame to its original format
+                    reshaped_surplus_withdrawal_df.reset_index(inplace=True)  # Reset index before unpivoting
+                    updated_unpivoted_df = projection_updater.unpivot_reshaped_data(withdrawal_editable_reshaped_df)
+
+                    # Update the main DataFrame with new values
+                    surplus_withdrawal_projections_df = projection_updater.update_main_dataframe(surplus_withdrawal_projections_df, updated_unpivoted_df)
+
+                    # Save the updated DataFrame to the database
+                    projection_updater.save_surplus_withdrawal_projections_to_db(surplus_withdrawal_projections_df, user_id)
+
+                    st.success("Changes saved successfully!") 
+
                 st.write("### 🟢 Updated surplus withdrawal projections")
                 st.dataframe(reshaped_surplus_withdrawal_df)
         except Exception as e:
@@ -22539,8 +22592,28 @@ if user_id:
                 st.write("### 🟢 Updated Assets projections")
                 st.dataframe(reshaped_assets_df)
         except Exception as e:
-            st.error(f"❌ Failed to load assets projections: {str(e)}") 
+            st.error(f"❌ Failed to load assets projections: {str(e)}")
 
+
+    elif option == "Income Section":    
+
+        st.write("### Changing milestone income projection")  
+        manage_goal_income_table_1 = st.radio("Do you want to update income projection?", ["No", "Yes"], index=0)
+        if manage_goal_income_table_1 == "Yes":
+            update_user_income_table = st.radio("Do you copy and update user income projection?", ["No", "Yes"], index=0)
+            if update_user_income_table == "Yes":
+                st.write("### Changing milestone income projection")
+                projection_updater.run_dynamic_milestone_income_projection(user_id)
+
+            update_user_combine_income_table = st.radio("Do you copy and update user combine income projection?", ["No", "Yes"], index=0)
+            if update_user_combine_income_table == "Yes":
+                st.write("### Changing combine milestone income projection")
+                projection_updater.run_dynamic_combine_milestone_income_projection(user_id)   
+
+        st.write("### Add the Additional Income Expense Category")
+        manage_additional_expense_table = st.radio("Do you want to update additional expense projection?", ["No", "Yes"], index=0)
+        if manage_additional_expense_table == "Yes":
+            projection_updater.run_additional_income_expense_criteria(user_id, month_choice) 
 
         try:
             dynamic_milestone_income_projection = projection_updater.load_dynamic_milestone_income_projection_from_db()
@@ -22562,8 +22635,28 @@ if user_id:
                 st.write("### 🟢 Updated Additional Expense projections")
                 st.dataframe(reshape_additional_expense_df)
         except Exception as e:
-            st.error(f"❌ Failed to load Additional Expense projections: {str(e)}") 
+            st.error(f"❌ Failed to load Additional Expense projections: {str(e)}")    
 
+            
+    elif option == "Cashflow, Actual, Ideal and FBS Projection Data":        
+        st.write("### Changing cashflow, Actual, Ideal and FBS Projection Data")
+        manage_automated_run_projection_table = st.radio("Do you want to update the Summary of all projections, Actual, Ideal and FBS Projection table?", ["No", "Yes"], index=0) 
+        if manage_automated_run_projection_table == "Yes":
+            if st.button("Update the Summary of all projections", key = 'all total of projections'):
+                projection_updater.run_dynamic_yearly_cf_projections(user_id, dob, retirement_age, month_choice) 
+
+            if st.button("Update the User Actual projection", key = 'User Actual projections'):
+                projection_updater.run_actual_projections_with_milestones(user_id, dob, retirement_age, month_choice) 
+
+            manage_ideal_projection_table = st.radio("Do you want to update ideal projection?", ["No", "Yes"], index=0)
+            if manage_ideal_projection_table == "Yes":
+                projection_updater.run_dynamic_ideal_projection_calculation(user_id) 
+
+            if st.button("Update the User Ideal Emergency projection", key = 'User Ideal Emergency projections'):
+                projection_updater.run_ideal_projections_emergency_fund_with_milestones(user_id, dob, retirement_age, month_choice)     
+
+            if st.button("Update the User FBS projection", key = 'User FBS projections'):
+                projection_updater.run_fbs_dynamic_projections_with_milestones(user_id, dob, retirement_age, month_choice)     
 
         try:
             dynamic_yearly_cf_projections_df = projection_updater.load_dynamic_yearly_cf_projections_df_from_db()
@@ -22599,7 +22692,6 @@ if user_id:
                 st.dataframe(reshaped_ideal_projections_df)
         except Exception as e:
             st.error(f"❌ Failed to load ideal projections: {str(e)}")   
-
 
         try:
             dynamic_ideal_projections_emergency_planning_df = projection_updater.load_dynamic_ideal_projections_emergency_planning_table_df_from_db(projection_updater.db_config)
@@ -22655,14 +22747,4 @@ if user_id:
         st.error("Please enter a valid user code.")      
 
 else:
-
     st.error("Please enter a valid user code.")          
-
-
-
-
-
-
-
-
-
