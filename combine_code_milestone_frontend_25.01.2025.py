@@ -86,53 +86,39 @@ driver = webdriver.Chrome(service=service, options=chrome_options)
 
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
 def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="plotly2img"):
-    """
-    Render a Plotly figure to PNG using Selenium (no Kaleido).
-    Includes:
-      ✓ Modebar removal
-      ✓ DPI scaling
-      ✓ Bounding-box resizing
-      ✓ Stable export for all PDF pages
-    """
 
-    # Clean layout
     fig.update_layout(
-        margin=dict(l=40, r=40, t=50, b=40),
+        margin=dict(l=40, r=40, t=60, b=50),
         showlegend=True
     )
 
-    # Disable modebar completely
     html = pio.to_html(
         fig,
         include_plotlyjs=True,
         full_html=True,
         div_id=div_id,
-        config={"displayModeBar": False}   # 🔥 removes zoom/pan/camera toolbar
+        config={"displayModeBar": False}
     )
 
-    # Fallback defaults
     fig_w = int(getattr(fig.layout, "width", 1400) or 1400)
     fig_h = int(getattr(fig.layout, "height", 850) or 850)
     if width is None: width = fig_w
     if height is None: height = fig_h
 
-    # Browser window larger than figure
-    win_w = width + 240
-    win_h = height + 260
+    win_w = width + 260
+    win_h = height + 320
 
-    # Save HTML
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
         f.write(html)
         html_path = f.name
 
-    # Chrome options
     chrome_opts = Options()
     chrome_opts.add_argument("--headless=new")
     chrome_opts.add_argument(f"--window-size={win_w},{win_h}")
     chrome_opts.add_argument("--disable-gpu")
     chrome_opts.add_argument("--no-sandbox")
     chrome_opts.add_argument("--disable-dev-shm-usage")
-    chrome_opts.add_argument("--force-device-scale-factor=2")   # 🔥 Retina-quality PNG
+    chrome_opts.add_argument("--force-device-scale-factor=2")
 
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=chrome_opts)
@@ -140,33 +126,41 @@ def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="pl
     try:
         driver.get("file://" + html_path)
 
-        # Wait until plot div is ready
         wait = WebDriverWait(driver, timeout)
         elem = wait.until(EC.presence_of_element_located((By.ID, div_id)))
 
-        driver.execute_script("arguments[0].scrollIntoView(true);", elem)
-        time.sleep(0.5)
+        # 🔥🔥🔥 CRITICAL FIX — WAIT FOR PLOTLY TO FULLY RENDER
+        driver.execute_script("""
+            return new Promise(resolve => {
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        setTimeout(resolve, 500);
+                    });
+                });
+            });
+        """)
+        # This ensures full 2 animation frames + 500ms = final stabilized layout.
 
-        # 🔥 IMPORTANT — BOUNDING BOX CORRECTION
+        # Get bounding box
         rect = driver.execute_script("""
             var r = arguments[0].getBoundingClientRect();
             return {w: Math.ceil(r.width), h: Math.ceil(r.height)};
         """, elem)
 
-        need_w = max(win_w, rect["w"] + 100)
-        need_h = max(win_h, rect["h"] + 180)
+        # Expand window if needed
+        need_w = rect["w"] + 200
+        need_h = rect["h"] + 260
 
-        if need_w != win_w or need_h != win_h:
-            driver.set_window_size(need_w, need_h)
-            time.sleep(0.5)
+        driver.set_window_size(need_w, need_h)
+        time.sleep(0.3)
 
-        # Finally capture screenshot
         return elem.screenshot_as_png
 
     finally:
         driver.quit()
         try: os.remove(html_path)
         except: pass
+
 
 
 
@@ -22748,4 +22742,5 @@ if user_id:
 
 else:
     st.error("Please enter a valid user code.")          
+
 
