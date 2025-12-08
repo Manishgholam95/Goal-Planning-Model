@@ -292,14 +292,28 @@ class ProjectionUpdater:
 
     def fetch_user_data(self, user_code):
         cursor = self.connection.cursor()
-        cursor.execute("""
-            SELECT dob, retirement_age 
-            FROM milestone_customer_profile 
-            WHERE user_code = %s AND is_active = true;
-        """, (user_code,))
-        dob, retirement_age = cursor.fetchone()
-        cursor.close()
-        return dob, retirement_age    
+        try:
+            cursor.execute("""
+                SELECT dob, retirement_age 
+                FROM milestone_customer_profile 
+                WHERE user_code = %s AND is_active = true;
+            """, (user_code,))
+
+            result = cursor.fetchone()
+
+            # If no record found
+            if result is None:
+                return None, None
+
+            dob, retirement_age = result
+            return dob, retirement_age
+
+        except Exception as e:
+            print(f"Error in fetch_user_data: {e}")
+            return None, None
+
+        finally:
+            cursor.close()    
     
     def fetch_user_name(self, user_id):
         cursor = self.connection.cursor()
@@ -1316,9 +1330,9 @@ class ProjectionUpdater:
             # Fetch all rows for this user from customer_profile
             cursor.execute("""
                 SELECT
-                    id, user_code, first_name, last_name, dob, gender, email, city, state, country, money_sign,
-                    marital_status, created_at, updated_at, education, retirement_age, member_id, pan_no, pan_name,
-                    is_active, email_verified, ms_completed_date
+                    id, user_code, first_name, last_name,gender, city, state, country, money_sign,
+                    marital_status, created_at, updated_at, education, retirement_age, member_id,
+                    is_active, email_verified, ms_completed_date, dob
                 FROM customer_profile
                 WHERE user_code = %s
                 AND is_active = TRUE;
@@ -1333,12 +1347,12 @@ class ProjectionUpdater:
             # Insert into milestone_customer_profile with explicit column list
             insert_sql = """
                 INSERT INTO milestone_customer_profile (
-                    id, user_code, first_name, last_name, dob, gender, email, city, state, country,
-                    money_sign, marital_status, created_at, updated_at, education, retirement_age, member_id, pan_no, pan_name,
-                    is_active, email_verified, ms_completed_date
+                    id, user_code, first_name, last_name, gender, city, state, country,
+                    money_sign, marital_status, created_at, updated_at, education, retirement_age, member_id,
+                    is_active, email_verified, ms_completed_date, dob
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
             """
 
@@ -1701,13 +1715,47 @@ class ProjectionUpdater:
                                     st.error(f"Error updating milestone_income: {e}")
             except Exception as e:
                 st.error(f"Error setting up update UI: {e}")
+
+	    st.subheader("Delete life stage growth Records")
+        do_delete_mi = st.radio(
+            "Do you want to delete ALL life stage growth rows for this user?",
+            ["No", "Yes"],
+            index=0,
+            key="life_stage_growth_delete_radio",
+        )
+
+        if do_delete_mi == "Yes":
+            try:
+                if not user_id:
+                    st.error("Please enter a valid user code above before deleting.")
+                else:
+                    if st.button("Delete milestone_life_stage_growth", key="life_stage_delete_btn"):
+                        try:
+                            with self.connection.cursor() as cursor:
+                                cursor.execute(
+                                    """
+                                    DELETE FROM life_stage_growth_milestone
+                                    WHERE user_code = %s;
+                                    """,
+                                    (str(user_id),),
+                                )
+                                self.connection.commit()
+                                if cursor.rowcount > 0:
+                                    st.success("Deleted life stage growth record(s) for this user.")
+                                else:
+                                    st.warning("No life stage growth records found for this user_code to delete.")
+                        except Exception as e:
+                            self.connection.rollback()
+                            st.error(f"Error deleting life stage growth records: {e}")
+            except Exception as e:
+                st.error(f"Error setting up delete UI: {e}")
         
         
     def manage_milestone_income(self):
         # ---------- UPDATE (yearly_amount for category_id 65 and 306) ----------
         st.subheader("Update Existing milestone_income Records")
         do_update_mi = st.radio(
-            "Do you want to update yearly_amount for Category 65 and/or 306?",
+            "Do you want to update yearly_amount for Annual Salary and Rental Income?",
             ["No", "Yes"],
             index=0,
             key="mi_update_radio",
@@ -13700,7 +13748,7 @@ class ProjectionUpdater:
             existing_categories = filtered_df['expense_category_name'].unique()
             expense_category_name = st.selectbox("Select an existing expense category:", existing_categories, key="expense_single_asset")
 
-            entry_type = st.radio("Choose entry type:", ('1 year interval','single', 'range', 'increment','incremental_rent','stop'), key="expense_entry_type")
+            entry_type = st.radio("Choose entry type:", ('1 year interval','single', 'range', 'increment','incremental_rent','child_expense','stop'), key="expense_entry_type")
 
             if entry_type == '1 year interval':
                 start_date = st.date_input("Enter the start date (YYYY-MM-DD):",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31),key="expense_one_year_interval_start_date")
@@ -13834,7 +13882,135 @@ class ProjectionUpdater:
 
                     # Replace the existing rows in the database
                     self.save_additional_income_expense_criteria_df_to_db(additional_income_expense_criteria_df, append=False)
-                    st.success("Incremental rent data saved successfully.")         
+                    st.success("Incremental rent data saved successfully.")     
+
+           
+			# 🔹 NEW CHILD EXPENSE LOGIC
+            elif entry_type == 'child_expense':
+                # Build a SQLAlchemy engine to read child_expense metadata
+                connection_string = (f"postgresql+psycopg2://{self.db_config['user']}:"
+                    f"{self.db_config['password']}@{self.db_config['host']}:"
+                    f"{self.db_config['port']}/{self.db_config['database']}"
+                )
+                engine = create_engine(connection_string)
+
+                # Get unique city_tier and age_range from child_expense table
+                try:
+                    child_meta = pd.read_sql("SELECT DISTINCT city_tier, age_range FROM child_expense;", engine)
+                    city_tiers = sorted(child_meta['city_tier'].dropna().unique().tolist())
+                    age_ranges = sorted(child_meta['age_range'].dropna().unique().tolist())
+                except Exception as e:
+                    st.error(f"Error loading city tier / age range from child_expense table: {e}")
+                    return additional_income_expense_criteria_df
+
+                if not city_tiers or not age_ranges:
+                    st.error("No city_tier or age_range data found in child_expense table.")
+                    return additional_income_expense_criteria_df
+
+                selected_city_tier = st.selectbox("Select City Tier:", city_tiers, key="child_expense_city_tier")
+
+                selected_age_range = st.selectbox( "Select Age Range:", age_ranges, key="child_expense_age_range")
+
+                start_date = st.date_input( "Enter the start date for child expense (YYYY-MM-DD):",
+                    value=date.today(),
+                    min_value=date(2000, 1, 1),
+                    max_value=date(2100, 12, 31),
+                    key="child_expense_start_date"
+                )
+
+                end_date = st.date_input( "Enter the end date for child expense (YYYY-MM-DD):",
+                    value=date.today(),
+                    min_value=date(2000, 1, 1),
+                    max_value=date(2100, 12, 31),
+                    key="child_expense_end_date"
+                )
+
+                growth_percentage = st.number_input(
+                    "Enter the growth percentage for child expense (%):",
+                    min_value=0.0,
+                    key="child_expense_growth_percent"
+                ) / 100
+
+                if st.button("Apply Child Expense and Save", key="child_expense_button"):
+
+                    start_dt = pd.to_datetime(start_date)
+                    end_dt = pd.to_datetime(end_date)
+
+                    if start_dt > end_dt:
+                        st.error("Start date cannot be greater than end date.")
+                        return additional_income_expense_criteria_df
+
+                    # Fetch base category_total
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute(
+                            """
+                            SELECT SUM(category_total)
+                            FROM child_expense
+                            WHERE city_tier = %s AND age_range = %s;
+                            """,
+                            (selected_city_tier, selected_age_range)
+                        )
+                        row = cursor.fetchone()
+                        cursor.close()
+                    except Exception as e:
+                        st.error(f"Database error: {e}")
+                        self.connection.rollback()
+                        return additional_income_expense_criteria_df
+
+                    if not row or row[0] is None:
+                        st.error("No matching child expense found for the inputs.")
+                        return additional_income_expense_criteria_df
+
+                    base_amount = float(row[0])
+
+                    # -------------------------
+                    # 🟩 EXACT LOGIC LIKE PASSIVE_SWP_INCOME
+                    # -------------------------
+
+                    projection_start = start_dt
+                    current_amount = base_amount
+
+                    while projection_start <= end_dt:
+
+                        # Assign this year's amount for next 12 months
+                        for i in range(12):
+
+                            # Calculate projection date
+                            projection_date = projection_start + pd.DateOffset(months=i)
+
+                            # Ensure last day of that month
+                            projection_date = projection_date.replace(
+                                day=monthrange(projection_date.year, projection_date.month)[1]
+                            )
+
+                            if projection_date <= end_dt:
+
+                                additional_income_expense_criteria_df.loc[
+                                    (additional_income_expense_criteria_df['entry_date']
+                                    == projection_date.strftime("%Y-%m-%d")) &
+                                    (additional_income_expense_criteria_df['user_code'] == user_code) &
+                                    (additional_income_expense_criteria_df['expense_category_name'] == expense_category_name),
+                                    'amount'
+                                ] = -abs(current_amount)
+
+                        # After 12 months → apply growth
+                        current_amount *= (1 + growth_percentage)
+
+                        # Move to next year (same logic as passive_swp_income)
+                        projection_start = projection_start.replace(
+                            year=projection_start.year + 1, day=1
+                        )
+                        projection_start = projection_start.replace(
+                            day=monthrange(projection_start.year, projection_start.month)[1]
+                        )
+
+                    # Save updated DF
+                    self.save_additional_income_expense_criteria_df_to_db(
+                        additional_income_expense_criteria_df, append=False
+                    )
+
+                    st.success("Child expense applied successfully.")
 
             elif entry_type == 'stop':
                 self.save_additional_income_expense_criteria_df_to_db(additional_income_expense_criteria_df)
@@ -22274,6 +22450,11 @@ if user_id:
     # Fetch user data (DOB, retirement age)
     dob, retirement_age = projection_updater.fetch_user_data(user_id)
 
+	# Fetch user data (DOB, retirement age)
+    dob, retirement_age = projection_updater.fetch_user_data(user_id)
+    if dob is None or retirement_age is None:
+        st.error("User profile data not found. Please check user_id or profile table.")
+
     if option == "Insert and update the milestone, Income, Assets and liability data":
 
         st.subheader("Insert, Update and Delete Milestones Liabilities")
@@ -22742,5 +22923,6 @@ if user_id:
 
 else:
     st.error("Please enter a valid user code.")          
+
 
 
