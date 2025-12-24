@@ -85,82 +85,79 @@ driver = webdriver.Chrome(service=service, options=chrome_options)
 
 
 # ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
-def fig_to_png_via_selenium(fig, width=None, height=None, timeout=30, div_id="plotly2img"):
+# ---------- helpers: render Plotly + DataFrames to PNG via headless Chrome ----------
+def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="plotly2img"):
+    """Render a Plotly figure to PNG bytes using headless Chrome (no kaleido)."""
+    # Use figure layout sizes if present; fall back to generous defaults
+    fig_w = int(getattr(fig.layout, "width", 1100) or 1100)
+    fig_h = int(getattr(fig.layout, "height", 900) or 900)
 
-    fig.update_layout(
-        margin=dict(l=40, r=40, t=60, b=50),
-        showlegend=True
-    )
-
-    html = pio.to_html(
-        fig,
-        include_plotlyjs=True,
-        full_html=True,
-        div_id=div_id,
-        config={"displayModeBar": False}
-    )
-
-    fig_w = int(getattr(fig.layout, "width", 1400) or 1400)
-    fig_h = int(getattr(fig.layout, "height", 850) or 850)
-    if width is None: width = fig_w
+    # Allow explicit overrides
+    if width is None:  width = fig_w
     if height is None: height = fig_h
 
-    win_w = width + 260
-    win_h = height + 320
+    # Add safety margin so nothing is clipped
+    win_w = width + 240
+    win_h = height + 280
+
+    html = pio.to_html(fig, include_plotlyjs="cdn", full_html=True, div_id=div_id)
 
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
         f.write(html)
         html_path = f.name
 
     chrome_opts = Options()
+    # If your Chrome is older, swap to "--headless"
     chrome_opts.add_argument("--headless=new")
     chrome_opts.add_argument(f"--window-size={win_w},{win_h}")
     chrome_opts.add_argument("--disable-gpu")
-    chrome_opts.add_argument("--no-sandbox")
     chrome_opts.add_argument("--disable-dev-shm-usage")
+    chrome_opts.add_argument("--no-sandbox")
+    # Sharper PNG (higher DPI)
     chrome_opts.add_argument("--force-device-scale-factor=2")
 
-    service = Service("/usr/bin/chromedriver")
+    service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_opts)
-
     try:
         driver.get("file://" + html_path)
+        time.sleep(2)
 
-        wait = WebDriverWait(driver, timeout)
-        elem = wait.until(EC.presence_of_element_located((By.ID, div_id)))
+        # Wait for plot to render
+        deadline = time.time() + timeout
+        elem = None
+        while time.time() < deadline:
+            try:
+                elem = driver.find_element(By.ID, div_id)
+                if elem.size.get("height", 0) > 0 and elem.size.get("width", 0) > 0:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        if not elem:
+            raise RuntimeError("Plotly figure did not render in time for screenshot.")
 
-        # 🔥🔥🔥 CRITICAL FIX — WAIT FOR PLOTLY TO FULLY RENDER
-        driver.execute_script("""
-            return new Promise(resolve => {
-                requestAnimationFrame(() => {
-                    requestAnimationFrame(() => {
-                        setTimeout(resolve, 500);
-                    });
-                });
-            });
-        """)
-        # This ensures full 2 animation frames + 500ms = final stabilized layout.
+        # Make sure it's fully in view
+        driver.execute_script("arguments[0].scrollIntoView(true);", elem)
+        time.sleep(0.2)
 
-        # Get bounding box
-        rect = driver.execute_script("""
-            var r = arguments[0].getBoundingClientRect();
-            return {w: Math.ceil(r.width), h: Math.ceil(r.height)};
-        """, elem)
-
-        # Expand window if needed
-        need_w = rect["w"] + 200
-        need_h = rect["h"] + 260
-
-        driver.set_window_size(need_w, need_h)
-        time.sleep(0.3)
+        # If the element is larger than the viewport, enlarge the window again
+        rect = driver.execute_script(
+            "var r = arguments[0].getBoundingClientRect(); return {w: Math.ceil(r.width), h: Math.ceil(r.height)};",
+            elem
+        )
+        need_w = max(win_w, rect["w"] + 80)
+        need_h = max(win_h, rect["h"] + 160)
+        if need_w != win_w or need_h != win_h:
+            driver.set_window_size(need_w, need_h)
+            time.sleep(0.2)
 
         return elem.screenshot_as_png
-
     finally:
         driver.quit()
-        try: os.remove(html_path)
-        except: pass
-
+        try:
+            os.remove(html_path)
+        except Exception:
+            pass
 
 
 
@@ -313,7 +310,8 @@ class ProjectionUpdater:
             return None, None
 
         finally:
-            cursor.close()    
+            cursor.close()
+    
     
     def fetch_user_name(self, user_id):
         cursor = self.connection.cursor()
@@ -374,6 +372,7 @@ class ProjectionUpdater:
             WHERE user_id = %s;
         """, (user_id,))
         result = cursor.fetchone()
+        #st.write('result',result)
 
         # -----------------------------
         # CASE 1: FIRST TIME USER
@@ -396,6 +395,8 @@ class ProjectionUpdater:
             self.copy_expenses_to_milestone_expenses(user_id)
             self.copy_assets_to_assets_milestones(user_id)
             self.copy_liabilities_to_liabilities_milestones(user_id)
+            self.copy_insurance_to_milestone_insurance(user_id)
+            self.copy_pmwell_response_to_milestone_pmwell_response(user_id)
             
 
             # Mark as initialized
@@ -415,6 +416,50 @@ class ProjectionUpdater:
             st.warning("User already initialized. Copy functions skipped.")
 
         cursor.close()
+
+    def copy_single_milestone_table(self, user_id, table_key):
+        """
+        Copy ONLY the requested milestone table.
+        Assumes user has already deleted records manually if needed.
+        """
+
+        try:
+            if table_key == "milestone customer profile":
+                self.copy_customer_profile_to_milestone_customer_profile(user_id)
+
+            elif table_key == "life stage growth milestone":
+                self.copy_life_stage_growth_to_milestone(user_id)    
+
+            elif table_key == "milestone income":
+                self.copy_income_to_milestone_income(user_id)   
+
+            elif table_key == "milestone customer details":
+                self.copy_customer_details_to_milestone_customer_details(user_id)     
+
+            elif table_key == "milestone expenses":
+                self.copy_expenses_to_milestone_expenses(user_id)   
+
+            elif table_key == "assets milestones":
+                self.copy_assets_to_assets_milestones(user_id)   
+
+            elif table_key == "liabilities milestones":
+                self.copy_liabilities_to_liabilities_milestones(user_id)      
+            
+            elif table_key == "milestone insurance":
+                self.copy_insurance_to_milestone_insurance(user_id)
+
+            elif table_key == "milestone pmwell response":
+                self.copy_pmwell_response_to_milestone_pmwell_response(user_id)    
+
+            else:
+                st.error("Invalid table selection.")
+                return
+
+            st.success(f"{table_key} copied successfully.")
+
+        except Exception as e:
+            st.error(f"Copy failed for {table_key}: {e}")
+    
 
     
     # New Functionality for Milestones Liabilities
@@ -483,7 +528,7 @@ class ProjectionUpdater:
             # Continue only if purpose is known
             if purpose and category_id:
                 pending_tenure = st.number_input("Pending Tenure (in months)", min_value=0, step=1, key="milestone_insert_pending_tenure")
-                milestone_year = st.date_input("Milestone Year (YYYY-MM-DD)",key="milestone_insert_entry_date").strftime("%Y-%m-%d")
+                milestone_year = st.date_input("Milestone Year (YYYY-MM-DD)",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="milestone_insert_entry_date").strftime("%Y-%m-%d")
 
                 loan_funded = st.selectbox("Loan Funded", ["Yes", "No"], key="milestone_insert_loan_funded")
                 amount = st.number_input("Enter Amount", min_value=0.0, key="milestone_insert_amount")
@@ -518,57 +563,113 @@ class ProjectionUpdater:
 
         # Update Existing Record
         st.subheader("Update Existing Milestones Liabilities Record")
-        user_id_update = st.radio("Do you want to update the milestone table?", ["No", "Yes"], index=0, key = 'update milestone table')
-        if user_id_update == 'Yes':
+
+        user_id_update = st.radio( "Do you want to update the milestone table?", ["No", "Yes"], index=0, key="update_milestone_table")
+
+        if user_id_update == "Yes":
             try:
-                # Fetch unique purposes for the user_id
+                # Fetch unique purposes
                 with self.connection.cursor() as cursor:
                     cursor.execute("""
-                        SELECT DISTINCT purpose FROM milestones_liabilities 
+                        SELECT DISTINCT purpose
+                        FROM milestones_liabilities
                         WHERE user_code = %s;
                     """, (user_id_1,))
                     unique_purposes = [row[0] for row in cursor.fetchall()]
 
-                selected_purpose = st.selectbox("Select Purpose to Update", unique_purposes, key= "milestone_update_records")
-                update_options = {
-                    "pending_tenure": st.selectbox("Pending Tenure", ["Same", "New"], key= "milestone_update_pending_tenure_option"),
-                    "milestone_year": st.selectbox("Milestone Year", ["Same", "New"], key= "milestone_update_milestone_year_option"),
-                    "loan_funded": st.selectbox("Loan Funded", ["Same", "New"], key= "milestone_update_loan_funded_option"),
-                    "amount": st.selectbox("Amount", ["Same", "New"], key= "milestone_update_amount_option"),
-                    "inflation": st.selectbox("Inflation", ["Same", "New"], key="milestone_update_inflation_option"),
-                    "your_percent_share": st.selectbox("Your Percent Share", ["Same", "New"], key= "milestone_update_your_percent_share_option"),
-                    "interest_rate": st.selectbox("Your Interest Rate", ["Same", "New"], key= "milestone_update_interest_rate_option")
-                }
+                if not unique_purposes:
+                    st.warning("No milestone liability records found.")
+                else:
+                    selected_purpose = st.selectbox(
+                        "Select Purpose to Update",
+                        unique_purposes,
+                        key="milestone_update_records"
+                    )
 
-                updates = {}
-                if update_options["pending_tenure"] == "New":
-                    updates["pending_tenure"] = st.number_input("New Pending Tenure", min_value=0, step=1, key= "milestone_update_pending_tenure")
-                if update_options["milestone_year"] == "New":
-                    updates["milestone_year"] = st.date_input("New Milestone Year (YYYY-MM-DD)",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key= "milestone_update_milestone_year").strftime("%Y-%m-%d")
-                if update_options["loan_funded"] == "New":
-                    updates["loan_funded"] = st.selectbox("New Loan Funded", ["Yes", "No"], key= "milestone_update_loan_funded")
-                if update_options["amount"] == "New":
-                    updates["amount"] = st.number_input("New Amount", min_value=0.0, key= "milestone_update_amount")
-                if update_options["inflation"] == "New":
-                    updates["inflation"] = st.number_input("New Inflation (%)", min_value=0.0, key= "milestone_update_inflation") / 100
-                if update_options["your_percent_share"] == "New":
-                    updates["your_percent_share"] = st.number_input("New Your Percent Share (%)", min_value=0.0, key= "milestone_update_your_percent_share") / 100
-                if update_options["interest_rate"] == "New":
-                    updates["interest_rate"] = st.number_input("New Interest rate (%)", min_value=0.0, key= "milestone_update_interest_rate") / 100    
+                    updates = {}
 
-                if st.button("Update Record"):
-                    try:
-                        with self.connection.cursor() as cursor:
-                            for column, value in updates.items():
-                                cursor.execute(f"""
-                                    UPDATE milestones_liabilities 
-                                    SET {column} = %s, last_updated_at = NOW() 
-                                    WHERE user_code = %s AND purpose = %s;
-                                """, (value, user_id_1, selected_purpose))
-                            self.connection.commit()
-                            st.success("Record updated successfully!")
-                    except Exception as e:
-                        st.error(f"Error updating record: {e}")
+                    # -------------------------------
+                    # Pending Tenure
+                    # -------------------------------
+                    pending_opt = st.selectbox("Pending Tenure", ["Same", "New"], key="milestone_update_pending_tenure_option")
+                    if pending_opt == "New":
+                        updates["pending_tenure"] = st.number_input("New Pending Tenure", min_value=0, step=1, key="milestone_update_pending_tenure")
+
+                    # -------------------------------
+                    # Milestone Year
+                    # -------------------------------
+                    milestone_year_opt = st.selectbox( "Milestone Year",["Same", "New"], key="milestone_update_milestone_year_option")
+                    if milestone_year_opt == "New":
+                        updates["milestone_year"] = st.date_input("New Milestone Year", value=date.today(), min_value=date(2000, 1, 1),
+                                                                      max_value=date(2100, 12, 31), key="milestone_update_milestone_year"
+                                                                      ).strftime("%Y-%m-%d")
+                    # -------------------------------
+                    # Loan Funded
+                    # -------------------------------
+                    loan_funded_opt = st.selectbox("Loan Funded", ["Same", "New"], key="milestone_update_loan_funded_option")  
+                    if loan_funded_opt == "New":
+                        updates["loan_funded"] = st.selectbox("New Loan Funded", ["Yes", "No"], key="milestone_update_loan_funded")
+
+                    # -------------------------------
+                    # Amount
+                    # -------------------------------
+                    amount_opt = st.selectbox( "Amount", ["Same", "New"], key="milestone_update_amount_option")
+                    if amount_opt == "New":
+                        updates["amount"] = st.number_input("New Amount", min_value=0.0, key="milestone_update_amount")
+
+                    # -------------------------------
+                    # Inflation
+                    # -------------------------------
+                    inflation_opt = st.selectbox("Inflation", ["Same", "New"], key="milestone_update_inflation_option")
+                    if inflation_opt == "New":
+                        updates["inflation"] = ( st.number_input( "New Inflation (%)", min_value=0.0, key="milestone_update_inflation") / 100)
+
+                    # -------------------------------
+                    # Your Percent Share
+                    # -------------------------------
+                    share_opt = st.selectbox("Your Percent Share", ["Same", "New"], key="milestone_update_your_percent_share_option" )                   
+                    if share_opt == "New":
+                        updates["your_percent_share"] = ( st.number_input("New Your Percent Share (%)", min_value=0.0, key="milestone_update_your_percent_share") / 100)
+
+                    # -------------------------------
+                    # Interest Rate
+                    # -------------------------------
+                    interest_opt = st.selectbox( "Interest Rate", ["Same", "New"], key="milestone_update_interest_rate_option")
+                    if interest_opt == "New":
+                        updates["interest_rate"] = (st.number_input("New Interest Rate (%)", min_value=0.0, key="milestone_update_interest_rate") / 100)
+
+                    # -------------------------------
+                    # Update Button
+                    # -------------------------------
+                    if st.button("Update Record"):
+                        if not updates:
+                            st.info("No changes selected (all set to Same).")
+                        else:
+                            try:
+                                with self.connection.cursor() as cursor:
+                                    set_clause = ", ".join(
+                                        [f"{col} = %s" for col in updates.keys()]
+                                    ) + ", last_updated_at = NOW()"
+
+                                    sql = f"""
+                                        UPDATE milestones_liabilities
+                                        SET {set_clause}
+                                        WHERE user_code = %s
+                                        AND purpose = %s;
+                                    """
+
+                                    params = list(updates.values()) + [user_id_1, selected_purpose]
+                                    cursor.execute(sql, tuple(params))
+                                    self.connection.commit()
+
+                                    if cursor.rowcount > 0:
+                                        st.success("Record updated successfully!")
+                                    else:
+                                        st.warning("No matching record found.")
+
+                            except Exception as e:
+                                self.connection.rollback()
+                                st.error(f"Error updating record: {e}")
 
             except Exception as e:
                 st.error(f"Error fetching purposes: {e}")
@@ -1592,6 +1693,125 @@ class ProjectionUpdater:
                 pass
 
 
+    def copy_insurance_to_milestone_insurance(self, user_code):
+        """
+        Copy matching rows from insurance -> milestone_insurance
+        for the given user_code, preserving column order/types.
+        """
+        try:
+            cursor = self.connection.cursor()
+
+            # Fetch all active insurance rows for this user
+            cursor.execute("""
+                SELECT
+                    id, created_at, last_updated_at, user_code, category_id, expiry,
+                    is_manual_entry, fetched_source, months, coverage, annual_premium, pending_tenure, payment_frequency,
+                    name, is_active, last_date, maturity_date, start_date, accrued_bonus, li_hi_category_id
+                FROM insurance
+                WHERE user_code = %s
+                AND is_active = TRUE;
+            """, (user_code,))
+
+            rows = cursor.fetchall()
+
+            if not rows:
+                st.error(f"No active insurance records found for user_code: {user_code}")
+                return
+
+            # Insert into milestone_insurance with explicit column list
+            insert_sql = """
+                INSERT INTO milestone_insurance (
+                    id, created_at, last_updated_at, user_code, category_id, expiry, is_manual_entry,
+                    fetched_source, months, coverage, annual_premium, pending_tenure, payment_frequency,
+                    name, is_active, last_date, maturity_date, start_date, accrued_bonus, li_hi_category_id
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+            """
+
+            for rec in rows:
+                cursor.execute(insert_sql, rec)
+
+            self.connection.commit()
+            st.success("Successfully copied insurance records to milestone_insurance.")
+
+        except Exception as e:
+            self.connection.rollback()
+            st.error(f"An error occurred while copying insurance data: {e}")
+
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+
+    def copy_pmwell_response_to_milestone_pmwell_response(self, user_code):
+        """
+        Copy matching rows from pmwell_response -> milestone_pmwell_response
+        for the given user_code, preserving column order and data types.
+        """
+        try:
+            cursor = self.connection.cursor()
+
+            # Fetch all active rows for this user
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    user_code,
+                    category_id,
+                    duration,
+                    start_age,
+                    cover,
+                    created_at,
+                    is_active
+                FROM pmwell_response
+                WHERE user_code = %s
+                AND is_active = TRUE;
+                """,
+                (user_code,),
+            )
+
+            rows = cursor.fetchall()
+
+            if not rows:
+                st.error(f"No active pmwell_response records found for user_code: {user_code}")
+                return
+
+            # Insert into milestone_pmwell_response
+            insert_sql = """
+                INSERT INTO milestone_pmwell_response (
+                    id,
+                    user_code,
+                    category_id,
+                    duration,
+                    start_age,
+                    cover,
+                    created_at,
+                    is_active
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s
+                );
+            """
+
+            for rec in rows:
+                cursor.execute(insert_sql, rec)
+
+            self.connection.commit()
+            st.success("Successfully copied pmwell_response records to milestone_pmwell_response.")
+
+        except Exception as e:
+            self.connection.rollback()
+            st.error(f"An error occurred while copying pmwell_response data: {e}")
+
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        
+
     def manage_life_stage_growth_milestone(self, user_id):
         st.subheader("Update Existing life_stage_growth_milestone Records")
         do_update = st.radio( "Do you want to update growth rate values?", ["No", "Yes"], index=0, key="lsgm_update_radio")
@@ -1716,7 +1936,7 @@ class ProjectionUpdater:
             except Exception as e:
                 st.error(f"Error setting up update UI: {e}")
 
-	    st.subheader("Delete life stage growth Records")
+        st.subheader("Delete life stage growth Records")
         do_delete_mi = st.radio(
             "Do you want to delete ALL life stage growth rows for this user?",
             ["No", "Yes"],
@@ -1749,6 +1969,9 @@ class ProjectionUpdater:
                             st.error(f"Error deleting life stage growth records: {e}")
             except Exception as e:
                 st.error(f"Error setting up delete UI: {e}")
+
+
+
         
         
     def manage_milestone_income(self):
@@ -2462,6 +2685,431 @@ class ProjectionUpdater:
             except Exception as e:
                 st.error(f"Error fetching names for deletion: {e}") 
 
+
+    def manage_milestone_insurance(self):
+
+        # =========================================================
+        # INSERT milestone_insurance
+        # =========================================================
+        st.subheader("Insert New milestone_insurance Record")
+
+        if st.radio( "Do you want to insert into milestone_insurance?", ["No", "Yes"], key="insurance_insert_radio") == 'Yes':
+            try:
+                name = st.text_input("Insurance Name", key="mi_ins_name")
+                st.write('64: Health Insurance and 101: Term Insurance')
+                category_id = st.number_input("Category ID", step=1, key="mi_ins_category")
+                coverage = st.number_input("Coverage Amount", value=0.0, key="mi_ins_coverage")
+                annual_premium = st.number_input("Insurance Premium", value=0.0, key="mi_ins_premium")
+                pending_tenure = st.number_input("Pending Tenure", value=0.0, key="mi_ins_tenure")
+                st.write('1 for yearly, 2 for half-yearly, 3 for 2 years, 4 for quarterly, 5 for 3 years, 12 for monthly')
+                payment_frequency = st.number_input("Payment Frequency", value=0.0, key="mi_ins_freq")
+                start_date = st.date_input("Start Date (YYYY-MM-DD)", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="mi_ins_start")
+                last_date = st.date_input("Last Date (YYYY-MM-DD)", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="mi_ins_last")
+                maturity_date = st.date_input("Maturity Date (YYYY-MM-DD)", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="mi_ins_maturity")
+
+                if st.button("Insert milestone_insurance", key="mi_insert_btn"):
+                    try:
+                        with self.connection.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO milestone_insurance (
+                                    created_at, last_updated_at, user_code, category_id,
+                                    coverage, annual_premium, pending_tenure, payment_frequency,
+                                    name, is_active, start_date, last_date, maturity_date
+                                )
+                                VALUES (
+                                    NOW(), NOW(), %s, %s,
+                                    %s, %s, %s, %s,
+                                    %s, TRUE, %s, %s, %s
+                                );
+                            """, (
+                                str(user_id),
+                                int(category_id),
+                                coverage,
+                                annual_premium,
+                                pending_tenure,
+                                payment_frequency,
+                                name,
+                                start_date,
+                                last_date,
+                                maturity_date
+                            ))
+                            self.connection.commit()
+                            st.success("Insurance record inserted successfully!")
+                    except Exception as e:
+                        self.connection.rollback()
+                        st.error(f"Error inserting insurance record: {e}")
+            except Exception as e:
+                st.error(f"Insert failed: {e}")            
+
+        # =========================================================
+        # UPDATE milestone_insurance (BY INSURANCE NAME)
+        # =========================================================
+        st.subheader("Update Existing milestone_insurance Record")
+
+        if st.radio( "Do you want to update an insurance record?", ["No", "Yes"], key="Insurance_update_radio") == 'Yes':    
+            try:
+                # Fetch insurance names for this user
+                with self.connection.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT DISTINCT name
+                        FROM milestone_insurance
+                        WHERE user_code = %s AND is_active = TRUE;
+                    """, (str(user_id),))
+                    insurance_names = [r[0] for r in cursor.fetchall()]
+
+                if not insurance_names:
+                    st.warning("No insurance records found for this user.")
+                else:
+                    selected_name = st.selectbox(
+                        "Select Insurance Name to Update",
+                        insurance_names,
+                        key="mi_update_name"
+                    )
+
+                    # ---------------------------
+                    # Same / New selectors
+                    # ---------------------------
+                    updates = {}
+
+                    # ---------------- Insurance Name ----------------
+                    name_opt = st.selectbox("Insurance Name", ["Same", "New"], key="mi_upd_name_opt")
+                    if name_opt == "New":
+                        updates["name"] = st.text_input("New Insurance Name", key="mi_new_name")
+
+                    # ---------------- Payment Frequency ----------------
+                    freq_opt = st.selectbox("Payment Frequency", ["Same", "New"], key="mi_upd_freq_opt")
+                    if freq_opt == "New":
+                        st.caption("1=Yearly, 2=Half-Yearly, 4=Quarterly, 12=Monthly")
+                        updates["payment_frequency"] = st.number_input(
+                            "New Payment Frequency", min_value=0.0, step=1.0, key="mi_new_freq"
+                        )
+
+                    # ---------------- Coverage ----------------
+                    cov_opt = st.selectbox("Coverage", ["Same", "New"], key="mi_upd_cov_opt")
+                    if cov_opt == "New":
+                        updates["coverage"] = st.number_input(
+                            "New Coverage", min_value=0.0, key="mi_new_coverage"
+                        )
+
+                    # ---------------- Annual Premium ----------------
+                    prem_opt = st.selectbox("Annual Premium", ["Same", "New"], key="mi_upd_prem_opt")
+                    if prem_opt == "New":
+                        updates["annual_premium"] = st.number_input(
+                            "New Annual Premium", min_value=0.0, key="mi_new_premium"
+                        )
+
+                    # ---------------- Pending Tenure ----------------
+                    tenure_opt = st.selectbox("Pending Tenure", ["Same", "New"], key="mi_upd_tenure_opt")
+                    if tenure_opt == "New":
+                        updates["pending_tenure"] = st.number_input(
+                            "New Pending Tenure", min_value=0.0, key="mi_new_tenure"
+                        )
+
+                    # ---------------- Start Date ----------------
+                    start_opt = st.selectbox("Start Date", ["Same", "New"], key="mi_upd_start_opt")
+                    if start_opt == "New":
+                        updates["start_date"] = st.date_input("New Start Date (YYYY-MM-DD)", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="mi_new_start")
+
+                    # ---------------- Last Date ----------------
+                    last_opt = st.selectbox("Last Date", ["Same", "New"], key="mi_upd_last_opt")
+                    if last_opt == "New":
+                        updates["last_date"] = st.date_input("New Last Date (YYYY-MM-DD)", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="mi_new_last")
+
+                    # ---------------- Maturity Date ----------------
+                    mat_opt = st.selectbox("Maturity Date", ["Same", "New"], key="mi_upd_mat_opt")
+                    if mat_opt == "New":
+                        updates["maturity_date"] = st.date_input( "New Maturity Date (YYYY-MM-DD)", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="mi_new_maturity")
+
+                    # ---------------- Execute Update ----------------
+                    if st.button("Update milestone_insurance", key="mi_update_btn"):
+                        if not updates:
+                            st.info("No changes selected (all set to Same).")
+                        else:
+                            try:
+                                set_parts = [f"{k} = %s" for k in updates]
+                                params = list(updates.values())
+
+                                set_parts.append("last_updated_at = NOW()")
+
+                                sql = f"""
+                                    UPDATE milestone_insurance
+                                    SET {', '.join(set_parts)}
+                                    WHERE user_code = %s
+                                    AND name = %s
+                                    AND is_active = TRUE;
+                                """
+
+                                params.extend([str(user_id), selected_name])
+
+                                with self.connection.cursor() as cursor:
+                                    cursor.execute(sql, tuple(params))
+                                    self.connection.commit()
+
+                                st.success("Insurance record updated successfully!")
+
+                            except Exception as e:
+                                self.connection.rollback()
+                                st.error(f"Error updating insurance record: {e}")
+
+            except Exception as e:
+                st.error(f"Error loading insurance data: {e}")
+
+
+        # =========================================================
+        # DELETE milestone_insurance (BY USER)
+        # =========================================================
+        st.subheader("Delete milestone_insurance Records")
+
+        if st.radio( "Do you want to delete ALL insurance records for this user?", ["No", "Yes"], key="insurance_delete_radio") == 'Yes':
+            if st.button("Delete All Records of liability of user", key = 'all insurance records deleted'):
+                try:
+                    with self.connection.cursor() as cursor:
+                        cursor.execute("""
+                            DELETE FROM milestone_insurance
+                            WHERE user_code = %s;
+                        """, (str(user_id),))
+                        self.connection.commit()
+
+                        if cursor.rowcount > 0:
+                            st.success("All insurance records deleted successfully!")
+                        else:
+                            st.warning("No records found to delete.")
+                except Exception as e:
+                    self.connection.rollback()
+                    st.error(f"Error deleting insurance records: {e}")
+
+
+        # Delete Existing milestone_insurance Record
+        st.subheader("Delete Milestone Insurance Record")
+
+        delete_insurance_radio = st.radio( "Do you want to delete a single insurance record of the user?",["No", "Yes"], index=0,
+            key="delete_milestone_insurance_radio")
+
+        if delete_insurance_radio == "Yes":
+            try:
+                with self.connection.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT DISTINCT name
+                        FROM milestone_insurance
+                        WHERE user_code = %s
+                        AND name IS NOT NULL
+                        AND name <> 'None'
+                        AND is_active = TRUE;
+                    """, (user_id,))
+                    insurance_names_delete = [row[0] for row in cursor.fetchall()]
+
+                if not insurance_names_delete:
+                    st.warning("No active insurance records found for this user.")
+                else:
+                    selected_insurance_name = st.selectbox(
+                        "Select Insurance Name to Delete",
+                        insurance_names_delete,
+                        key="milestone_insurance_delete_select"
+                    )
+
+                    if st.button("Delete Insurance Record", key="milestone_insurance_delete_btn"):
+                        try:
+                            with self.connection.cursor() as cursor:
+                                cursor.execute("""
+                                    DELETE FROM milestone_insurance
+                                    WHERE user_code = %s
+                                    AND name = %s
+                                    AND is_active = TRUE;
+                                """, (user_id, selected_insurance_name))
+
+                                self.connection.commit()
+
+                                if cursor.rowcount > 0:
+                                    st.success("Insurance record deleted successfully!")
+                                else:
+                                    st.warning("No matching record found to delete.")
+
+                        except Exception as e:
+                            self.connection.rollback()
+                            st.error(f"Error deleting insurance record: {e}")
+
+            except Exception as e:
+                st.error(f"Error fetching insurance names for deletion: {e}")
+        
+
+    def manage_milestone_pmwell_response(self):
+        # ---------- UPDATE ----------
+        st.subheader("Update Existing milestone_pmwell_response Records")
+
+        do_update_pm = st.radio(
+            "Do you want to update PMWELL response values?",
+            ["No", "Yes"],
+            index=0,
+            key="pmwell_update_radio",
+        )
+
+        if do_update_pm == "Yes":
+            try:
+                if not user_id:
+                    st.error("Please enter a valid user code above before updating.")
+                else:
+                    # --------------------------------------------------
+                    # Insurance type dropdown (CATEGORY MAPPING)
+                    # --------------------------------------------------
+                    insurance_option = st.selectbox(
+                        "Select Insurance Type",
+                        ["Ideal Health Insurance", "Ideal Life Insurance"],
+                        key="pmwell_insurance_type_select",
+                    )
+
+                    category_map = {
+                        "Ideal Health Insurance": 165,
+                        "Ideal Life Insurance": 166,
+                    }
+
+                    selected_category_id = category_map[insurance_option]
+
+                    st.info(f"Updating records for **{insurance_option}**")
+
+                    # --------------------------------------------------
+                    # Same / New controls
+                    # --------------------------------------------------
+                    update_options = {
+                        "duration": st.selectbox(
+                            "Duration",
+                            ["Same", "New"],
+                            key="pmwell_update_duration_option",
+                        ),
+                        "start_age": st.selectbox(
+                            "Start Age",
+                            ["Same", "New"],
+                            key="pmwell_update_start_age_option",
+                        ),
+                        "cover": st.selectbox(
+                            "Cover Amount",
+                            ["Same", "New"],
+                            key="pmwell_update_cover_option",
+                        ),
+                    }
+
+                    updates = {}
+
+                    if update_options["duration"] == "New":
+                        updates["duration"] = st.number_input(
+                            "New Duration",
+                            min_value=0.0,
+                            step=1.0,
+                            key="pmwell_update_duration_value",
+                        )
+
+                    if update_options["start_age"] == "New":
+                        updates["start_age"] = st.number_input(
+                            "New Start Age",
+                            min_value=0.0,
+                            step=1.0,
+                            key="pmwell_update_start_age_value",
+                        )
+
+                    if update_options["cover"] == "New":
+                        updates["cover"] = st.number_input(
+                            "New Cover Amount",
+                            min_value=0.0,
+                            step=10000.0,
+                            key="pmwell_update_cover_value",
+                        )
+
+                    # --------------------------------------------------
+                    # UPDATE ACTION
+                    # --------------------------------------------------
+                    if st.button("Update milestone_pmwell_response", key="pmwell_update_btn"):
+                        if not updates:
+                            st.info("No changes selected (all set to Same). Nothing to update.")
+                        else:
+                            try:
+                                msgs = []
+                                with self.connection.cursor() as cursor:
+
+                                    for col, val in updates.items():
+                                        cursor.execute(
+                                            f"""
+                                            UPDATE milestone_pmwell_response
+                                            SET {col} = %s
+                                            WHERE user_code = %s
+                                            AND category_id = %s
+                                            AND is_active = TRUE;
+                                            """,
+                                            (float(val), str(user_id), selected_category_id),
+                                        )
+
+                                        if cursor.rowcount > 0:
+                                            msgs.append(
+                                                f"Updated {col} for {insurance_option}"
+                                            )
+                                        else:
+                                            msgs.append(
+                                                f"No row updated for {col} ({insurance_option})"
+                                            )
+
+                                self.connection.commit()
+
+                                for m in msgs:
+                                    st.success(m)
+
+                            except Exception as e:
+                                self.connection.rollback()
+                                st.error(
+                                    f"Error updating milestone_pmwell_response: {e}"
+                                )
+
+            except Exception as e:
+                st.error(f"Error setting up update UI: {e}")
+
+        # ---------- DELETE ----------
+        st.subheader("Delete milestone_pmwell_response Records")
+
+        do_delete_pm = st.radio(
+            "Do you want to delete ALL milestone_pmwell_response rows for this user?",
+            ["No", "Yes"],
+            index=0,
+            key="pmwell_delete_radio",
+        )
+
+        if do_delete_pm == "Yes":
+            try:
+                if not user_id:
+                    st.error("Please enter a valid user code above before deleting.")
+                else:
+                    if st.button(
+                        "Delete milestone_pmwell_response",
+                        key="pmwell_delete_btn",
+                    ):
+                        try:
+                            with self.connection.cursor() as cursor:
+                                cursor.execute(
+                                    """
+                                    DELETE FROM milestone_pmwell_response
+                                    WHERE user_code = %s;
+                                    """,
+                                    (str(user_id),),
+                                )
+
+                                self.connection.commit()
+
+                                if cursor.rowcount > 0:
+                                    st.success(
+                                        "Deleted milestone_pmwell_response record(s) for this user."
+                                    )
+                                else:
+                                    st.warning(
+                                        "No milestone_pmwell_response record found for this user_code."
+                                    )
+
+                        except Exception as e:
+                            self.connection.rollback()
+                            st.error(
+                                f"Error deleting milestone_pmwell_response: {e}"
+                            )
+
+            except Exception as e:
+                st.error(f"Error setting up delete UI: {e}")
+ 
+
+
     def display_assets_data(self, user_code):
         """Fetch and display the formatted assets table"""
         assets_df = self.fetch_asset_milestones_table(user_code)
@@ -2789,6 +3437,92 @@ class ProjectionUpdater:
             print(f"Error fetching customer liabilities data: {e}")
             return None
 
+
+    def display_milestone_insurance_data(self, user_code):
+        """Fetch and display the formatted milestone insurance table"""
+        milestone_insurance_df = self.fetch_milestone_insurance_table(user_code)
+        if milestone_insurance_df is not None:
+            st.dataframe(milestone_insurance_df)
+
+
+    def fetch_milestone_insurance_table(self, user_id):
+        """Fetch milestone insurance details for the given user from the database."""
+
+        query = """
+            SELECT name, coverage, annual_premium, payment_frequency, pending_tenure, start_date, last_date, maturity_date
+            FROM milestone_insurance
+            WHERE user_code = %s
+            AND is_active = TRUE AND name IS NOT NULL AND name <> 'None'
+            ORDER BY start_date;
+        """
+
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(query, (str(user_id),))
+            columns = [desc[0] for desc in cursor.description]
+            data = cursor.fetchall()
+            cursor.close()
+
+            milestone_insurance_df = pd.DataFrame(data, columns=columns)
+
+            if milestone_insurance_df.empty:
+                st.warning("No milestone insurance records found for the given user.")
+                return None
+
+            return milestone_insurance_df
+
+        except Exception as e:
+            print(f"Error fetching milestone insurance data: {e}")
+            return None
+        
+
+    def display_pmwell_response_data(self, user_code):
+        """Fetch and display the formatted PMWELL response table"""
+        pmwell_df = self.fetch_pmwell_response_table(user_code)
+
+        if pmwell_df is not None:
+            # st.write("### PMWELL Response Table")
+            st.dataframe(pmwell_df)
+
+    def fetch_pmwell_response_table(self, user_id):
+        """Fetch PMWELL response data for the given user from milestone_pmwell_response."""
+
+        query = """
+            SELECT
+                a.category_id,
+                c.name,
+                a.duration,
+                a.start_age,
+                a.cover
+            FROM milestone_pmwell_response a
+            JOIN milestones_category c
+                ON a.category_id = c.id
+            WHERE a.user_code = %s
+            AND a.is_active = TRUE;
+        """
+
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(query, (user_id,))
+            columns = [desc[0] for desc in cursor.description]
+            data = cursor.fetchall()
+            cursor.close()
+
+            # Convert to DataFrame
+            pmwell_df = pd.DataFrame(data, columns=columns)
+
+            if pmwell_df.empty:
+                st.warning("No PMWELL response data found for the given user.")
+                return None
+
+            return pmwell_df
+
+        except Exception as e:
+            print(f"Error fetching PMWELL response data: {e}")
+            return None
+        
+    
+        
 
     # New Functionality for asset category
     def manage_asset_category_table(self):
@@ -6276,8 +7010,8 @@ class ProjectionUpdater:
             view_option = st.radio( "Do you want to convert data to Monthly or Annually?", ["Monthly", "Annually"])
 
             st.write("### Select Date Range")
-            start_date = st.date_input("Start Date", value=datetime.today())
-            end_date = st.date_input("End Date", value=datetime.today()) 
+            start_date = st.date_input("Start Date", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31),key = 'All pre goal 234')
+            end_date = st.date_input("End Date", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key = 'All pre goal 244') 
 
             # Apply filtering by date range
             #filtered_df = self.filter_data_by_date_range(dynamic_pre_goal_cashflow_df, start_date, end_date) 
@@ -6900,7 +7634,35 @@ class ProjectionUpdater:
         # Reset the index to bring asset_name as a column for better readability
         reshaped_df = reshaped_df.reset_index()
         reshaped_df.set_index('asset_name', inplace=True)  # Set asset_name as index
-        return reshaped_df    
+
+        # 🔥 APPLY INDIAN NUMBER FORMATTING (DISPLAY ONLY)
+        formatted_df = reshaped_df.applymap(self.format_indian_number) 
+        return formatted_df  
+
+    def reshape_display_without_format_investment_projections(self, investment_projections_df, user_id):
+        # Filter data for the specified user
+        user_df = investment_projections_df[investment_projections_df['user_code'] == user_id]
+
+        user_df['entry_date'] = pd.to_datetime(user_df['entry_date'])
+        user_df = user_df.sort_values(by='entry_date')
+
+        # Convert entry_date to string format to avoid frontend issues
+        user_df['entry_date'] = user_df['entry_date'].astype(str)
+
+        # Pivot the DataFrame to get asset names as row index, while entry_date becomes the columns
+        reshaped_df = user_df.pivot_table(index='asset_name', 
+                                          columns=['entry_date', 'age'],
+                                          values='asset_value', 
+                                          aggfunc='sum', 
+                                          fill_value=0)
+        reshaped_df.columns = [f"{date},{age}" for date, age in reshaped_df.columns]
+        # Reset the index to bring asset_name as a column for better readability
+        reshaped_df = reshaped_df.reset_index()
+        reshaped_df.set_index('asset_name', inplace=True)  # Set asset_name as index
+
+        # 🔥 APPLY INDIAN NUMBER FORMATTING (DISPLAY ONLY)
+        #formatted_df = reshaped_df.applymap(self.format_indian_number) 
+        return reshaped_df  
     
     # Function to delete records with entry_date less than the current date
     def delete_old_investment_records(self):
@@ -6922,6 +7684,10 @@ class ProjectionUpdater:
             # Step 1: Entry date input
             entry_date_input = st.date_input("Select the entry date for custom investment",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="custom_entry_date")
             entry_date_str = entry_date_input.strftime('%Y-%m-%d')
+
+            # -----------------------------
+            surplus_entry_date_input = st.date_input( "Select the entry_date from which surplus should be taken for investment:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="surplus_date_input")
+            surplus_entry_date_str = surplus_entry_date_input.strftime("%Y-%m-%d")
 
             # Step 2: Input amount
             custom_amount = st.number_input("Enter the amount you want to invest:", min_value=0.0, key="custom_investment_amount")
@@ -6961,14 +7727,14 @@ class ProjectionUpdater:
                 # Step 9: Show projection values for decision making
                 cursor = self.connection.cursor()
                 cursor.execute("""
-                    SELECT equity, real_estate, passive_income_assets, debt, alternative_investments
+                    SELECT equity, real_estate, commodity, debt, alternative_investments
                     FROM dynamic_ideal_projection_calculation
                     WHERE entry_date = %s;
                 """, (entry_date_input,))
                 ideal_values = cursor.fetchone()
 
                 cursor.execute("""
-                    SELECT equity, real_estate, passive_income, debt, alternate_investments
+                    SELECT equity, real_estate, commodity, debt, alternate_investments
                     FROM actual_projections_with_milestones
                     WHERE entry_date = %s;
                 """, (entry_date_input,))
@@ -6981,7 +7747,7 @@ class ProjectionUpdater:
                     ideal_values = [round(val * 100) for val in ideal_values]
                     actual_values = [round(val * 100) for val in actual_values]
 
-                    col_names = ["Equity", "Real Estate", "Passive Income", "Debt", "Alternative Investments"]
+                    col_names = ["Equity", "Real Estate", "Commodity", "Debt", "Alternative Investments"]
                     df_compare = pd.DataFrame({
                         "Projection Type": ["Ideal", "Actual"],
                         **{name: [ideal, actual] for name, ideal, actual in zip(col_names, ideal_values, actual_values)}
@@ -7064,7 +7830,9 @@ class ProjectionUpdater:
 
                 # Step 9: Load and return updated DataFrame
                 investment_projections_df = self.load_investment_projections_from_db(user_id)
+                st.write('investment_projections_df',investment_projections_df)
                 st.session_state[f"investment_projections_df_{user_id}"] = investment_projections_df
+                st.rerun()
                 return investment_projections_df
 
             # Step 5: Action Button
@@ -7120,35 +7888,121 @@ class ProjectionUpdater:
                 # Step 9: Load and return updated DataFrame
                 investment_projections_df = self.load_investment_projections_from_db(user_id)
                 st.session_state[f"investment_projections_df_{user_id}"] = investment_projections_df
-                return investment_projections_df      
+                st.rerun()
+                return investment_projections_df   
+
+                
+            if st.button("Apply the custom investment method by using end total surplus", key="cust_end_end_total_surplus_investme_calculation"):
+
+    
+
+                # Convert original investment date
+                #entry_date_str = entry_date_input.strftime("%Y-%m-%d")
+
+                # --------------------------------------------
+                # Step 1: Fetch end_total_surplus for surplus date
+                # --------------------------------------------
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT end_total_surplus
+                    FROM dynamic_yearly_cf_projections
+                    WHERE user_code = %s AND entry_date = %s;
+                """, (user_id, surplus_entry_date_str))
+
+                result = cursor.fetchone()
+                cursor.close()
+
+                if result is None:
+                    st.warning(f"No surplus data found for surplus date {surplus_entry_date_str}")
+                    return
+
+                end_total_surplus_difference = float(result[0])
+                st.write(f"End Total Surplus on {surplus_entry_date_str}: ₹{end_total_surplus_difference:,.2f}")
+
+                # --------------------------------------------
+                # Step 2: Check if surplus is sufficient
+                # --------------------------------------------
+                if end_total_surplus_difference < custom_amount:
+                    st.warning("Entered amount exceeds available surplus.")
+                    return
+
+                # --------------------------------------------
+                # Step 3: Calculate invested amount using surplus date value
+                # --------------------------------------------
+                invested_amount = round(end_total_surplus_difference * (percentage_to_invest / 100), 2)
+
+                # --------------------------------------------
+                # Step 4: Update investment_projections at original investment date
+                # --------------------------------------------
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT asset_value
+                    FROM investment_projections
+                    WHERE user_code = %s AND asset_name = %s AND entry_date = %s;
+                """, (user_id, selected_asset, entry_date_str))
+
+                result = cursor.fetchone()
+
+                if result:
+                    current_asset_value = float(result[0])
+                    updated_asset_value = current_asset_value - invested_amount
+
+                    cursor.execute("""
+                        UPDATE investment_projections
+                        SET asset_value = %s
+                        WHERE user_code = %s AND asset_name = %s AND entry_date = %s;
+                    """, (updated_asset_value, user_id, selected_asset, entry_date_str))
+
+                    self.connection.commit()
+
+                    st.success(
+                        f"₹{invested_amount:,.2f} has been invested in **{selected_asset}** "
+                        f"on **{entry_date_str}**, using surplus from **{surplus_entry_date_str}**."
+                    )
+                else:
+                    st.warning(f"No existing asset record found for '{selected_asset}' on {entry_date_str}. No update performed.")
+
+                cursor.close()
+
+                # --------------------------------------------
+                # Step 5: Refresh and rerun
+                # --------------------------------------------
+                investment_projections_df = self.load_investment_projections_from_db(user_id)
+                st.session_state[f"investment_projections_df_{user_id}"] = investment_projections_df
+                st.rerun()
+
+                return investment_projections_df
+       
     
         return None
 
     def load_investment_projections_from_db(self, user_id):
-        """Loads investment projections from DB only once per session."""
-        
+
         key = f"investment_projections_df_{user_id}"
 
-        if key not in st.session_state:
-            # Load only user_id rows for speed
-            connection_string = f"postgresql+psycopg2://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['database']}"
-            engine = create_engine(connection_string)
+        # Always reload fresh data from DB
+        connection_string = (
+            f"postgresql+psycopg2://{self.db_config['user']}:{self.db_config['password']}"
+            f"@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['database']}"
+        )
+        engine = create_engine(connection_string)
 
-            # Safety: table may not exist on first run
-            inspector = inspect(engine)
-            if not inspector.has_table("investment_projections"):
-                st.session_state[key] = pd.DataFrame()
-                return st.session_state[key]
+        inspector = inspect(engine)
+        if not inspector.has_table("investment_projections"):
+            st.session_state[key] = pd.DataFrame()
+            return st.session_state[key]
 
+        query = """
+            SELECT *
+            FROM investment_projections
+            WHERE user_code = %s
+        """
 
-            query = """
-                SELECT *
-                FROM investment_projections
-                WHERE user_code = %s
-            """
-            st.session_state[key] = pd.read_sql(query, engine, params=(user_id,))
+        df = pd.read_sql(query, engine, params=(user_id,))
+        st.session_state[key] = df   # update cache too
 
-        return st.session_state[key]
+        return df
+
     
 
     def run_investment_projections(self, user_id, month_choice):
@@ -7562,9 +8416,14 @@ class ProjectionUpdater:
 
         updated_df = self.fill_user_based_investment_values(user_id)
 
+        # 🔥 FORCE REFRESH FROM DATABASE if custom update is applied
         if updated_df is not None:
             investment_projections_df = updated_df
+            st.write('updated_df',updated_df)
+            st.session_state[f"investment_projections_df_{user_id}"] = updated_df
 
+        # 🔥 Always reload after custom operations
+        investment_projections_df = self.load_investment_projections_from_db(user_id)    
         reshaped_df = self.reshape_display_investment_projections(investment_projections_df, user_id)
         st.write("### Investment Projections after changes:")
         st.dataframe(reshaped_df)
@@ -7879,7 +8738,37 @@ class ProjectionUpdater:
         # Reset the index to bring asset_name as a column for better readability
         reshaped_df = reshaped_df.reset_index()
         reshaped_df.set_index('liabilities_name', inplace=True)  # Set asset_name as index
+        # 🔥 APPLY INDIAN NUMBER FORMATTING (DISPLAY ONLY)
+        formatted_df = reshaped_df.applymap(self.format_indian_number) 
+        return formatted_df
+
+    
+    # Reshape the investment projections for the required format
+    def reshape_display_without_format_loan_repayment_projections(self, dynamic_loan_repayment_projections_df, user_id):
+        # Filter data for the specified user
+        user_df = dynamic_loan_repayment_projections_df[dynamic_loan_repayment_projections_df['user_code'] == user_id]
+
+        user_df['entry_date'] = pd.to_datetime(user_df['entry_date'])
+        user_df = user_df.sort_values(by='entry_date')
+
+        # Convert entry_date to string format to avoid frontend issues
+        user_df['entry_date'] = user_df['entry_date'].astype(str)
+
+        # Pivot the DataFrame to get asset names as row index, while entry_date becomes the columns
+        reshaped_df = user_df.pivot_table(index='liabilities_name', 
+                                          columns=['entry_date', 'age'],
+                                          values='liabilities_value', 
+                                          aggfunc='sum', 
+                                          fill_value=0)
+        reshaped_df.columns = [f"{date},{age}" for date, age in reshaped_df.columns]
+        # Reset the index to bring asset_name as a column for better readability
+        reshaped_df = reshaped_df.reset_index()
+        reshaped_df.set_index('liabilities_name', inplace=True)  # Set asset_name as index
+        # 🔥 APPLY INDIAN NUMBER FORMATTING (DISPLAY ONLY)
+        #formatted_df = reshaped_df.applymap(self.format_indian_number) 
         return reshaped_df
+
+
     
     # Function to delete records with entry_date less than the current date
     def delete_old_loan_repayments_records(self):
@@ -8084,9 +8973,9 @@ class ProjectionUpdater:
                 st.success("Range date update applied and save to the database.")
 
         elif entry_type == 'increment':
-            entry_date = st.date_input("Entry Date:", key="loan_increment_date")
+            entry_date = st.date_input("Entry Date:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="loan_increment_date")
             percentage = st.number_input("Increment percentage:", key="loan_increment_percentage")
-            end_date_increment = st.date_input("End Date for Increment:", key="loan_end_date_increment")
+            end_date_increment = st.date_input("End Date for Increment:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="loan_end_date_increment")
             liability_name = st.selectbox("Select asset name for increment:", distinct_liabilities_names, key="loan_increment_liability")
             if st.button("Apply Increment Update",key="apply_loan_increment_update"):
                 dynamic_loan_repayment_projections_df = self.update_dynamic_loan_repayment_projections(user_id, dynamic_loan_repayment_projections_df, distinct_liabilities_names, entry_type=entry_type, increment_params={'entry_date': entry_date.strftime('%Y-%m-%d'), 'percentage': percentage, 'end_date': end_date_increment.strftime('%Y-%m-%d'), 'liability_name': liability_name})
@@ -8598,9 +9487,9 @@ class ProjectionUpdater:
                 st.success("Range date update applied and save to the database.")
 
         elif entry_type == 'increment':
-            entry_date = st.date_input("Entry Date:", key="loan_surplus_increment_date")
-            percentage = st.number_input("Increment percentage:", key="loan_surplus_increment_percentage")
-            end_date_increment = st.date_input("End Date for Increment:", key="loan_surplus_end_date_increment")
+            entry_date = st.date_input("Entry Date:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="loan_surplus_increment_date")
+            percentage = st.number_input("Increment percentage:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="loan_surplus_increment_percentage")
+            end_date_increment = st.date_input("End Date for Increment:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="loan_surplus_end_date_increment")
             liability_name = st.selectbox("Select asset name for increment:", distinct_liabilities_names, key="loan_surplus_increment_liability")
             if st.button("Apply Increment Update",key="apply_loan_surplus_increment_update"):
                 dynamic_loan_surplus_repayment_projections_df = self.update_dynamic_loan_surplus_repayment_projections(user_id, dynamic_loan_surplus_repayment_projections_df, distinct_liabilities_names, entry_type=entry_type, increment_params={'entry_date': entry_date.strftime('%Y-%m-%d'), 'percentage': percentage, 'end_date': end_date_increment.strftime('%Y-%m-%d'), 'liability_name': liability_name})
@@ -8929,7 +9818,7 @@ class ProjectionUpdater:
 
         #if apply_repayment == "Yes":
         # Input pop-ups
-        selected_entry_date = st.date_input("Select the entry_date to apply repayment:").strftime('%Y-%m-%d')
+        selected_entry_date = st.date_input("Select the entry_date to apply repayment:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31),key = "key for repayment milestone").strftime('%Y-%m-%d')
         liabilities_names = dynamic_liabilities_projections_df['liabilities_name'].unique()
         selected_liabilities_name = st.selectbox("Select the liabilities_name for repayment logic:", liabilities_names)
 
@@ -9358,8 +10247,8 @@ class ProjectionUpdater:
         # Reset the index to bring asset_name as a column for better readability
         reshaped_df = reshaped_df.reset_index()
         reshaped_df.set_index('liabilities_name', inplace=True)
-
-        return reshaped_df 
+        formatted_df = reshaped_df.applymap(self.format_indian_number)
+        return formatted_df 
     
     def user_exists_in_liabilities_proj_db(self, user_id):
         connection_string = f"postgresql+psycopg2://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['database']}"
@@ -9840,7 +10729,8 @@ class ProjectionUpdater:
         # Reset the index to bring asset_name as a column for better readability
         reshaped_df = reshaped_df.reset_index()
         reshaped_df.set_index('liabilities_name', inplace=True)
-        return reshaped_df 
+        formatted_df = reshaped_df.applymap(self.format_indian_number)
+        return formatted_df 
     
     def user_exists_in_liabilities_outflows_proj_db(self, user_id):
         connection_string = f"postgresql+psycopg2://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['database']}"
@@ -10018,7 +10908,7 @@ class ProjectionUpdater:
             entry_type = st.radio("Choose entry type for assets: ", ('single', 'range', 'increment', 'stop'), key="asset_entry_type")
 
             if entry_type == 'single':
-                single_date = st.date_input("Select date for asset update:", key="single_asset_date")
+                single_date = st.date_input("Select date for asset update:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31),  key="single_asset_date")
                 single_date_str = single_date.strftime('%Y-%m-%d')
                 asset_name = st.selectbox("Select asset name:", distinct_asset_names, key="single_asset_name")
                 amount = st.number_input("Enter asset value:", value=0.0, key="single_asset_amount")
@@ -10031,8 +10921,8 @@ class ProjectionUpdater:
                     self.save_dynamic_assets_projections_df_to_db(dynamic_assets_projections_df)
 
             elif entry_type == 'range':
-                start_date = st.date_input("Start Date for asset:", key="asset_range_start")
-                end_date = st.date_input("End Date for asset:", key="asset_range_end")
+                start_date = st.date_input("Start Date for asset:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="asset_range_start")
+                end_date = st.date_input("End Date for asset:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="asset_range_end")
                 asset_name = st.selectbox("Select asset name for range:", distinct_asset_names, key="range_asset_name")
                 amount = st.number_input("Enter amount for asset range:", value=0.0, key="range_asset_amount")
 
@@ -10098,7 +10988,7 @@ class ProjectionUpdater:
             entry_type = st.radio("Choose entry type:", ('single', 'range', 'increment', 'stop'), key="loan_entry_liability_type")
 
             if entry_type == 'single':
-                single_date = st.date_input("Select date:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31))
+                single_date = st.date_input("Select date:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31),key = "key for liabilities mil")
                 single_date_str = single_date.strftime('%Y-%m-%d')
                 liability_name = st.selectbox("Select liability name:", distinct_liabilities_names, key="loan_liability_name_1")
                 amount = st.number_input("Enter amount:", value=0.0, key="loan_amount_liability")
@@ -10314,7 +11204,7 @@ class ProjectionUpdater:
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT i.name AS insurance_name, i.category_id
-            FROM insurance i
+            FROM milestone_insurance i
             WHERE user_code = %s AND name IS NOT NULL AND name <> 'None' AND is_active = true;
         """, (user_id,))
 
@@ -10376,7 +11266,7 @@ class ProjectionUpdater:
             cursor = self.connection.cursor()
             cursor.execute("""
                 SELECT 1
-                FROM insurance 
+                FROM milestone_insurance 
                 WHERE user_code = %s AND category_id = 143;
             """, (user_code,))
             category_143_exists = cursor.fetchone() is not None
@@ -10422,7 +11312,7 @@ class ProjectionUpdater:
             cursor = self.connection.cursor()
             cursor.execute("""
                 SELECT name, last_date, start_date, annual_premium, payment_frequency
-                FROM insurance
+                FROM milestone_insurance
                 WHERE user_code = %s AND (category_id = 101 OR category_id = 102 OR category_id = 228 OR category_id = 231 OR category_id = 230) and is_active = TRUE;
             """, (user_id,))
 
@@ -10430,83 +11320,81 @@ class ProjectionUpdater:
             #st.write('insurance_data',insurance_data)
             cursor.close()
 
+            # Frequency → month increments
+            frequency_map = {
+                1: 12,   # yearly
+                2: 6,    # half-yearly
+                3: 24,   # every 2 years
+                4: 3,    # quarterly
+                5: 36,   # every 3 years
+                12: 1    # monthly
+            }
+
 
             for insurance_name, last_date, start_date, annual_premium, payment_frequency in insurance_data:
-                #st.write('insurance_name',insurance_name)
-                #start_date = datetime.strptime(start_date, '%Y-%m-%d')
-                #last_date = datetime.strptime(last_date, '%Y-%m-%d')
-                # current_year = datetime.now().year
-                # current_month = datetime.now().month
-                # last_day_of_current_month = datetime(current_year, current_month, monthrange(current_year, current_month)[1])
-                # start_date = last_day_of_current_month
+
                 if start_date is None or last_date is None:
-                # Skip processing if start_date or last_date is None
                     continue
-                
-                #print('last_date',last_date)
-                last_date = pd.to_datetime(last_date)  # Ensure last_date is datetime64[ns]
-                start_date = pd.to_datetime(start_date)  # Ensure start_date is datetime64[ns]
-                last_date = last_date.replace(day=monthrange(last_date.year, last_date.month)[1])  # Ensure last_date is the last day of the month
-                start_date = start_date.replace(day=monthrange(start_date.year, start_date.month)[1]) 
-                #print('after last_date',last_date)
-                #print('after start_date', start_date)
-                while start_date <= last_date:
-                    if payment_frequency == 1:
-                        matching_rows = dynamic_insurance_outflows_projections_df[
-                            (dynamic_insurance_outflows_projections_df['insurance_name'] == insurance_name) &
-                            (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']).dt.month == start_date.month) &
-                            (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']) >= start_date) &
-                            (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']) <= last_date)
-                        ]
-                        #st.write('display matching_rows',matching_rows)
-                        # if not matching_rows.empty:
-                        #     dynamic_liabilities_outflows_projections_df.loc[
-                        #         (dynamic_liabilities_outflows_projections_df['liabilities_name'] == insurance_name) &
-                        #         (pd.to_datetime(dynamic_liabilities_outflows_projections_df['entry_date']).dt.month == start_date.month),
-                        #         'liabilities_value'
-                        #     ] = -abs(annual_premium)   
-                        if not matching_rows.empty:
-                            dynamic_insurance_outflows_projections_df.loc[
-                            matching_rows.index,
-                            'insurance_value'
-                        ] = -abs(annual_premium)    
 
+                # Convert to datetime
+                last_date = pd.to_datetime(last_date)
+                start_date = pd.to_datetime(start_date)
 
-                    # NEW: handle quarterly payments (payment_frequency == 4)
-                    elif payment_frequency == 4:
-                        matching_rows = dynamic_insurance_outflows_projections_df[
-                            (dynamic_insurance_outflows_projections_df['insurance_name'] == insurance_name) &
-                            (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']).dt.month == start_date.month) &
-                            (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']) >= start_date) &
-                            (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']) <= last_date)
-                        ]
-                        if not matching_rows.empty:
-                            dynamic_insurance_outflows_projections_df.loc[
-                                matching_rows.index,
-                                'insurance_value'
-                            ] = -abs(float(annual_premium)) / 4.0
+                # Snap to month-ends
+                last_date = last_date.replace(day=monthrange(last_date.year, last_date.month)[1])
+                start_date = start_date.replace(day=monthrange(start_date.year, start_date.month)[1])
 
-                        # Move by one quarter and snap to month-end, then continue loop
-                        start_date = start_date + pd.DateOffset(months=3)
-                        start_date = start_date.replace(day=monthrange(start_date.year, start_date.month)[1])
-                        continue
+                # Validate frequency
+                if payment_frequency not in frequency_map:
+                    print(f"Unknown payment frequency: {payment_frequency} for {insurance_name}")
+                    continue
 
-                    #print('start_date',start_date)
-                    #start_date = (start_date + timedelta(days=32)).replace(day=1)  # Move to the next month  
-                    #start_date = (start_date + timedelta(days=365)).replace(month=1, day=1)
-                    start_date = start_date + pd.DateOffset(years=1)
-                    start_date = start_date.replace(day=monthrange(start_date.year, start_date.month)[1])
+                # Calculate installment amount
+                if payment_frequency == 1:
+                    installment = -abs(annual_premium)
+                elif payment_frequency == 12:
+                    installment = -abs(annual_premium) / 12
+                elif payment_frequency == 4:
+                    installment = -abs(annual_premium) / 4
+                elif payment_frequency == 2:
+                    installment = -abs(annual_premium) / 2
+                elif payment_frequency == 3:
+                    installment = -abs(annual_premium) / 2
+                elif payment_frequency == 5:
+                    installment = -abs(annual_premium) / 3
+                else:
+                    installment = -abs(annual_premium)
 
-                    #start_date = start_date + pd.offsets.MonthEnd(0)  
-                    #start_date = start_date.date()
-                    print('start_date',start_date)    
+                # Step size in months
+                step_months = frequency_map[payment_frequency]
+
+                # Start processing payments
+                current_date = start_date
+
+                while current_date <= last_date:
+
+                    matching_rows = dynamic_insurance_outflows_projections_df[
+                        (dynamic_insurance_outflows_projections_df['insurance_name'] == insurance_name) &
+                        (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']).dt.month == current_date.month) &
+                        (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']) >= current_date) &
+                        (pd.to_datetime(dynamic_insurance_outflows_projections_df['entry_date']) <= last_date)
+                    ]
+
+                    if not matching_rows.empty:
+                        dynamic_insurance_outflows_projections_df.loc[
+                            matching_rows.index, 'insurance_value'
+                        ] = installment
+
+                    # Move by frequency interval
+                    current_date = current_date + pd.DateOffset(months=step_months)
+                    current_date = current_date.replace(day=monthrange(current_date.year, current_date.month)[1])    
 
 
             # Check for category_id 64 (health insurance) in the insurance table
             cursor = self.connection.cursor()
             cursor.execute("""
                 SELECT name, start_date, last_date, annual_premium, payment_frequency
-                FROM insurance
+                FROM milestone_insurance
                 WHERE user_code = %s AND category_id = 64 AND is_active = TRUE;
             """, (user_id,))
             health_insurance_data = cursor.fetchall()
@@ -10518,7 +11406,7 @@ class ProjectionUpdater:
                 #annual_premium = annual_premium
                 if start_date == datetime(1, 1, 1).date():  # Check for the default date 0001-01-01
                     st.write(f"Start date for {name} is not set.")
-                    start_date_input = st.date_input(f"Enter start date for {name}:")
+                    start_date_input = st.date_input(f"Enter start date for {name}:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key = "key for outflows liabi mil")
                     start_date = pd.to_datetime(start_date_input)
 
                 # Convert start_date to last day of its month
@@ -10714,8 +11602,8 @@ class ProjectionUpdater:
         reshaped_df.columns = [f"{date},{age}" for date, age in reshaped_df.columns]
         reshaped_df = reshaped_df.reset_index()
         reshaped_df.set_index('insurance_name', inplace=True)  # Set asset_name as index
-        
-        return reshaped_df        
+        formatted_df = reshaped_df.applymap(self.format_indian_number)
+        return formatted_df        
     
     def run_dynamic_insurance_outflows_projections(self, user_id, month_choice):
 
@@ -11219,7 +12107,30 @@ class ProjectionUpdater:
         reshaped_df.columns = [f"{date},{age}" for date, age in reshaped_df.columns]
         reshaped_df = reshaped_df.reset_index()
         reshaped_df.set_index('asset_name', inplace=True)  # Set asset_name as index
-        
+        formatted_df = reshaped_df.applymap(self.format_indian_number)
+        return formatted_df
+    
+    def reshape_display_without_format_surplus_related_withdrawal_projections(self, surplus_withdrawal_projections_df, user_id):
+        # Filter data for the specified user
+        user_df = surplus_withdrawal_projections_df[surplus_withdrawal_projections_df['user_code'] == user_id]
+        user_df['entry_date'] = pd.to_datetime(user_df['entry_date'])
+        user_df = user_df.sort_values(by='entry_date')
+
+        # Convert entry_date to string format to avoid frontend issues
+        user_df['entry_date'] = user_df['entry_date'].astype(str)
+
+        # Pivot the DataFrame to get asset names as row index, while entry_date becomes the columns
+        reshaped_df = user_df.pivot_table(index='asset_name', 
+                                          columns=['entry_date', 'age'],
+                                          values='asset_value', 
+                                          aggfunc='sum', 
+                                          fill_value=0)
+
+        # Reset the index to bring asset_name as a column for better readability
+        reshaped_df.columns = [f"{date},{age}" for date, age in reshaped_df.columns]
+        reshaped_df = reshaped_df.reset_index()
+        reshaped_df.set_index('asset_name', inplace=True)  # Set asset_name as index
+        #formatted_df = reshaped_df.applymap(self.format_indian_number)
         return reshaped_df
     
     # Unpivoting the reshaped DataFrame
@@ -12070,22 +12981,16 @@ class ProjectionUpdater:
     #     else:
     #         return pd.read_sql('dynamic_assets_projections', engine)
 
-    def load_dynamic_assets_projections_df_from_db(self, user_id):
-        """Loads dynamic projections from DB only once per session."""
-        
+    def load_dynamic_assets_projections_df_from_db(self, user_id, force_reload=False):
         key = f"dynamic_assets_projections_df_{user_id}"
 
-        if key not in st.session_state:
-            # Load only user_id rows for speed
+        if force_reload or key not in st.session_state:
             connection_string = f"postgresql+psycopg2://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['database']}"
             engine = create_engine(connection_string)
-
-            # Safety: table may not exist on first run
             inspector = inspect(engine)
             if not inspector.has_table("dynamic_assets_projections"):
                 st.session_state[key] = pd.DataFrame()
                 return st.session_state[key]
-
 
             query = """
                 SELECT *
@@ -12108,94 +13013,98 @@ class ProjectionUpdater:
     def update_dynamic_assets_projections(self, dynamic_assets_projections_df, user_id):
         cursor = self.connection.cursor()
 
-        # Cache all investment and withdrawal values for the user into dictionaries
+        # Cache investment values
         cursor.execute("""
             SELECT entry_date, category_id, asset_name, asset_value
             FROM investment_projections
             WHERE user_code = %s
         """, (user_id,))
-        investment_data = cursor.fetchall()
         investment_map = {
-            (row[0], row[1], row[2]): float(row[3]) if row[3] is not None else 0.0
-            for row in investment_data
+            (row[0], row[1], row[2]): float(row[3]) if row[3] else 0.0
+            for row in cursor.fetchall()
         }
 
+        # Cache withdrawal values
         cursor.execute("""
             SELECT entry_date, category_id, asset_name, asset_value
             FROM surplus_withdrawal_projections
             WHERE user_code = %s
         """, (user_id,))
-        withdrawal_data = cursor.fetchall()
         withdrawal_map = {
-            (row[0], row[1], row[2]): float(row[3]) if row[3] is not None else 0.0
-            for row in withdrawal_data
+            (row[0], row[1], row[2]): float(row[3]) if row[3] else 0.0
+            for row in cursor.fetchall()
         }
 
+        # Cache initial asset values
         cursor.execute("""
             SELECT category_id, name, current_amount
             FROM assets_milestones
             WHERE user_code = %s AND name IS NOT NULL AND name <> 'None' AND is_active = true
         """, (user_id,))
-        initial_assets = cursor.fetchall()
         initial_value_map = {
-            (row[1], row[0]): float(row[2]) if row[2] is not None else 0.0
-            for row in initial_assets
+            (row[1], row[0]): float(row[2]) if row[2] else 0.0
+            for row in cursor.fetchall()
         }
 
-        cursor.execute("""
-            SELECT id, weightage
-            FROM milestones_category
-        """)
-        weightage_data = cursor.fetchall()
+        # Cache weightages
+        cursor.execute("SELECT id, weightage FROM milestones_category")
         weightage_map = {
-            row[0]: float(row[1]) if row[1] is not None else 0.0
-            for row in weightage_data
+            row[0]: float(row[1]) if row[1] else 0.0
+            for row in cursor.fetchall()
         }
 
-        for assets_name, category_id in dynamic_assets_projections_df[['assets_name', 'category_id']].drop_duplicates().values:
+        # Iterate by asset_name and category_id combination
+        for asset_name, category_id in dynamic_assets_projections_df[['assets_name', 'category_id']].drop_duplicates().values:
             filtered_df = dynamic_assets_projections_df[
-                (dynamic_assets_projections_df['assets_name'] == assets_name) &
+                (dynamic_assets_projections_df['assets_name'] == asset_name) &
                 (dynamic_assets_projections_df['category_id'] == category_id)
             ].copy()
 
             if filtered_df.empty:
                 continue
 
+            # Get first entry
             first_idx = filtered_df.index.min()
-            first_entry_date = dynamic_assets_projections_df.at[first_idx, 'entry_date']
-            initial_value = initial_value_map.get((assets_name, category_id), 0.0)
-            investment_value = investment_map.get((first_entry_date, category_id, assets_name), 0.0)
-            withdrawal_value = withdrawal_map.get((first_entry_date, category_id, assets_name), 0.0)
+            first_entry_date = filtered_df.at[first_idx, 'entry_date']
+            initial_value = initial_value_map.get((asset_name, category_id), 0.0)
+            investment_value = investment_map.get((first_entry_date, category_id, asset_name), 0.0)
+            withdrawal_value = withdrawal_map.get((first_entry_date, category_id, asset_name), 0.0)
 
+            # First month asset value
             assets_value = initial_value - investment_value + withdrawal_value
             dynamic_assets_projections_df.at[first_idx, 'assets_value'] = assets_value
 
             weightage_value = weightage_map.get(category_id, 0.0)
+            prev_assets_value = assets_value
+            prev_date = datetime.strptime(first_entry_date, "%Y-%m-%d")
 
-            previous_date = datetime.strptime(first_entry_date, '%Y-%m-%d')
+            # Loop over future rows of same asset
+            for idx in filtered_df.index[1:]:
+                #st.write('idx',idx)
+                curr_date = datetime.strptime(dynamic_assets_projections_df.at[idx, 'entry_date'], "%Y-%m-%d")
 
-            for idx in range(first_idx + 1, len(dynamic_assets_projections_df)):
-                row = dynamic_assets_projections_df.loc[idx]
-                if row['assets_name'] == assets_name and row['category_id'] == category_id:
-                    previous_date = (previous_date.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-                    previous_idx = dynamic_assets_projections_df[
-                        (dynamic_assets_projections_df['entry_date'] == previous_date.strftime('%Y-%m-%d')) &
-                        (dynamic_assets_projections_df['assets_name'] == assets_name) &
-                        (dynamic_assets_projections_df['category_id'] == category_id)
-                    ].index
+                # Use previous value if dates are in correct sequence
+                if curr_date > prev_date:
+                    key = (dynamic_assets_projections_df.at[idx, 'entry_date'], category_id, asset_name)
+                    #st.write('key',key)
+                    investment_value = investment_map.get(key, 0.0)
+                    withdrawal_value = withdrawal_map.get(key, 0.0)
 
-                    previous_value = dynamic_assets_projections_df.at[previous_idx[0], 'assets_value'] if not previous_idx.empty else 0.0
-                    current_entry_date = row['entry_date']
+                    # Apply projection formula
+                    # st.write('prev_assets_value',prev_assets_value)
+                    # st.write('weightage_value',weightage_value)
+                    # st.write('investment_value',investment_value)
+                    # st.write('withdrawal_value',withdrawal_value)
+                    curr_assets_value = prev_assets_value * (1 + weightage_value / 12.0) - investment_value + withdrawal_value
+                    # st.write('curr_assets_value',curr_assets_value)
+                    dynamic_assets_projections_df.at[idx, 'assets_value'] = curr_assets_value
 
-                    investment_value = investment_map.get((current_entry_date, category_id, assets_name), 0.0)
-                    withdrawal_value = withdrawal_map.get((current_entry_date, category_id, assets_name), 0.0)
-
-                    current_assets_value = previous_value * (1 + weightage_value / 12.0) - investment_value + withdrawal_value
-                    dynamic_assets_projections_df.at[idx, 'assets_value'] = current_assets_value
-
-                    previous_date = datetime.strptime(current_entry_date, '%Y-%m-%d')
+                    # Update trackers
+                    prev_assets_value = curr_assets_value
+                    prev_date = curr_date
 
         return dynamic_assets_projections_df
+
 
 
     
@@ -12548,7 +13457,8 @@ class ProjectionUpdater:
                                           aggfunc='sum',
                                           fill_value=0).reset_index()
         reshaped_df.set_index('assets_name', inplace=True)  # Set asset_name as index
-        return reshaped_df
+        formatted_df = reshaped_df.applymap(self.format_indian_number)
+        return formatted_df
     
     def clear_existing_asset_data_for_user(self, user_id):
         # Delete existing data for the user_id from the dynamic_assets_projections table
@@ -12608,7 +13518,8 @@ class ProjectionUpdater:
         user_name = self.fetch_user_name(user_id)
 
         # Load the existing data
-        dynamic_assets_projections_df = self.load_dynamic_assets_projections_df_from_db(user_id)
+        dynamic_assets_projections_df = self.load_dynamic_assets_projections_df_from_db(user_id, force_reload=True)
+        #st.write('dynamic_assets_projections_df',dynamic_assets_projections_df)
         st.write('after loading the data')
 
         # Create new projections if the user_id is not in the database
@@ -12626,9 +13537,9 @@ class ProjectionUpdater:
 
 
         #if st.button("Update Good Liability Asset Category", key="update_Good_liability_asset_asset"): 
-        dynamic_assets_projections_df = self.calculate_assets_value_for_category_604(user_id, dynamic_assets_projections_df)
-        dynamic_assets_projections_df = self.calculate_assets_value_for_category_627(user_id, dynamic_assets_projections_df)
-        dynamic_assets_projections_df = self.calculate_assets_value_for_category_628(user_id, dynamic_assets_projections_df)
+        # dynamic_assets_projections_df = self.calculate_assets_value_for_category_604(user_id, dynamic_assets_projections_df)
+        # dynamic_assets_projections_df = self.calculate_assets_value_for_category_627(user_id, dynamic_assets_projections_df)
+        # dynamic_assets_projections_df = self.calculate_assets_value_for_category_628(user_id, dynamic_assets_projections_df)
         dynamic_assets_projections_df = self.update_negative_assets_projections(user_id, dynamic_assets_projections_df)
         
         reshaped_df = self.display_reshape_dynamic_assets_projections(dynamic_assets_projections_df, user_id)
@@ -12887,8 +13798,8 @@ class ProjectionUpdater:
 
             if not passive_swp_data.empty:
                 real_estate_growth_percentage = self.get_real_estate_growth_percentage()
-                start_date = st.date_input("Enter the start date for passive rental income (YYYY-MM-DD):")
-                end_date = st.date_input("Enter the end date for passive rental income (YYYY-MM-DD):")
+                start_date = st.date_input("Enter the start date for passive rental income (YYYY-MM-DD):", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31),key = "debt_swp_start_date")
+                end_date = st.date_input("Enter the end date for passive rental income (YYYY-MM-DD):",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31),key = "debt_swp_end_date")
 
                 start_date = pd.to_datetime(start_date)
                 end_date = pd.to_datetime(end_date)
@@ -12916,8 +13827,8 @@ class ProjectionUpdater:
 
             if not passive_rental_data.empty:
                 real_estate_growth_percentage = self.get_real_estate_growth_percentage_1()
-                start_date = st.date_input("Enter the start date for passive rental income (YYYY-MM-DD):",key = 'rental_start_date')
-                end_date = st.date_input("Enter the end date for passive rental income (YYYY-MM-DD):", key = 'rental_end_date')
+                start_date = st.date_input("Enter the start date for passive rental income (YYYY-MM-DD):",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key = 'rental_start_date')
+                end_date = st.date_input("Enter the end date for passive rental income (YYYY-MM-DD):", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key = 'rental_end_date')
 
                 start_date = pd.to_datetime(start_date)
                 end_date = pd.to_datetime(end_date)
@@ -12980,7 +13891,7 @@ class ProjectionUpdater:
                 #dynamic_milestone_income_projection['entry_date'] = pd.to_datetime(dynamic_milestone_income_projection['entry_date'])
 
                 if update_option == 'single':
-                    selected_date = st.date_input("Select entry date:", key="single_income_date")
+                    selected_date = st.date_input("Select entry date:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="single_income_date")
                     selected_column = st.selectbox("Select column to update:", ['passive_income', 'taxes','total_expense','household_lifestyle_expense_amount'], key="single_income_column")
                     amount = st.number_input("Enter amount:", value=0.0, key="single_income_amount")
 
@@ -13011,8 +13922,8 @@ class ProjectionUpdater:
 
                 elif update_option == 'increment':
                     selected_column = st.selectbox("Select column to increment:", ['passive_income', 'taxes','total_expense','household_lifestyle_expense_amount'], key="increment_income_column")
-                    start_date = st.date_input("Start increment from date:", key="increment_start_date")
-                    end_date = st.date_input("End increment at date:", key="increment_end_date")
+                    start_date = st.date_input("Start increment from date:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="increment_start_date")
+                    end_date = st.date_input("End increment at date:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="increment_end_date")
                     increment_pct = st.number_input("Enter increment %:", value=5.0, key="increment_income_pct") / 100
 
                     if st.button("Apply Increment Update", key="apply_increment_income"):
@@ -13036,8 +13947,8 @@ class ProjectionUpdater:
                     growth_month = st.selectbox("Select Growth Month", [str(i).zfill(2) for i in range(1, 13)], key="growth_month_middle")
                     growth_rate = st.number_input("Enter flat growth percentage:", value=5.0, key="flat_growth_rate") / 100
                     column_to_update = st.selectbox("Select column to apply growth:", ['passive_income', 'taxes','total_expense','household_lifestyle_expense_amount'], key="growth_column_select")
-                    start_date = st.date_input("Start Entry Date:", key="growth_start_date")
-                    end_date = st.date_input("End Entry Date:", key="growth_end_date")
+                    start_date = st.date_input("Start Entry Date:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="growth_start_date")
+                    end_date = st.date_input("End Entry Date:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="growth_end_date")
 
                     if st.button("Apply Middle Growth", key="apply_middle_growth"):
                         df = dynamic_milestone_income_projection
@@ -13545,16 +14456,17 @@ class ProjectionUpdater:
 
  
         # Collect inputs for procedure
-        appraisal_end_date = st.selectbox("Select the appraisal end date (MM-DD):", ['03-31', '02-28','12-31','10-31'], key="passive_tax_appraisal_end_date")
-        tax_regime = st.selectbox("Select tax regime:", ["old", "new"], key="passive_tax_regime")            
+        appraisal_end_date = st.selectbox("Select the appraisal end date (MM-DD):", ['01-31','02-28','03-31','04-30','05-31','06-30','07-31','08-31','09-30','10-31','11-30','12-31'], key="passive_tax_appraisal_end_date")
+        tax_regime = st.selectbox("Select tax regime:", ["old", "new"], key="passive_tax_regime") 
+        bonus_month = st.selectbox( "Enter the month for growth expense (MM):",['04', '01', '02', '03', '05', '06', '07', '08', '09', '10', '11', '12'], key="growth_income_month_input_bonus")           
 
         # Call tax procedure
         if st.button("Run Tax Projection for passive income"):
             try:
                 with self.connection.cursor() as cursor:
                     cursor.execute("""
-                        CALL calculate_passive_income_tax_projection(%s, %s, %s)
-                    """, (user_id, tax_regime, appraisal_end_date))
+                        CALL calculate_passive_income_tax_projection(%s, %s, %s, %s)
+                    """, (user_id, tax_regime, appraisal_end_date, bonus_month))
                 self.connection.commit()
                 st.success("Tax projection generated and updated in the database.")
 
@@ -13608,16 +14520,17 @@ class ProjectionUpdater:
 
  
         # Collect inputs for procedure
-        appraisal_end_date = st.selectbox("Select the appraisal end date (MM-DD):", ['03-31', '12-31','10-31'], key="passive_tax_appraisal_end_date")
-        tax_regime = st.selectbox("Select tax regime:", ["old", "new"], key="passive_tax_regime")            
+        appraisal_end_date = st.selectbox("Select the appraisal end date (MM-DD):", ['01-31','02-28','03-31','04-30','05-31','06-30','07-31','08-31','09-30','10-31','11-30','12-31'], key="passive_tax_appraisal_end_date")
+        tax_regime = st.selectbox("Select tax regime:", ["old", "new"], key="passive_tax_regime")        
+        bonus_month = st.selectbox( "Enter the month for growth expense (MM):",['04', '01', '02', '03', '05', '06', '07', '08', '09', '10', '11', '12'], key="growth_income_month_input_bonus")    
 
         # Call tax procedure
-        if st.button("Run Tax Projection for passive income"):
+        if st.button("Calculate Tax Projection for Bonus income"):
             try:
                 with self.connection.cursor() as cursor:
                     cursor.execute("""
-                        CALL calculate_passive_income_tax_projection(%s, %s, %s)
-                    """, (user_id, tax_regime, appraisal_end_date))
+                        CALL calculate_passive_income_tax_projection(%s, %s, %s, %s)
+                    """, (user_id, tax_regime, appraisal_end_date, bonus_month))
                 self.connection.commit()
                 st.success("Tax projection generated and updated in the database.")
 
@@ -13627,6 +14540,33 @@ class ProjectionUpdater:
 
             except Exception as e:
                 st.error(f"Failed to execute tax projection: {e}") 
+
+
+        # ----------------------------------------------------------
+        # Collect inputs for tax projection procedure
+        # ----------------------------------------------------------
+        st.write('Input of start date and end date to calculate the tax for range')
+        tax_start_date = st.date_input( "Select tax start date:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="tax_start_date_input")
+        tax_end_date = st.date_input( "Select tax end date:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="tax_end_date_input" )
+
+        # ----------------------------------------------------------
+        # Call tax procedure
+        # ----------------------------------------------------------
+        if st.button("Calculate Tax Projection for Passive Income"):
+            try:
+                with self.connection.cursor() as cursor:
+                    cursor.execute("""
+                        CALL calculate_custom_date_passive_income_tax_projection(%s, %s, %s, %s, %s)
+                    """,( user_id, tax_regime, appraisal_end_date, tax_start_date.strftime('%Y-%m-%d'), tax_end_date.strftime('%Y-%m-%d')))
+                self.connection.commit()
+                st.success(f"Tax projection applied from {tax_start_date} to {tax_end_date}.")
+
+                # ✅ Reload updated data
+                dynamic_milestone_income_projection = self.load_dynamic_milestone_income_projection_from_db()
+
+            except Exception as e:
+                st.error(f"Failed to execute tax projection: {e}")
+
         # Add Streamlit inputs for generate_tax_projection procedure
         st.subheader("Run Tax Projection Procedure")
         dynamic_milestone_income_projection = self.load_dynamic_milestone_income_projection_from_db()
@@ -13882,10 +14822,9 @@ class ProjectionUpdater:
 
                     # Replace the existing rows in the database
                     self.save_additional_income_expense_criteria_df_to_db(additional_income_expense_criteria_df, append=False)
-                    st.success("Incremental rent data saved successfully.")     
+                    st.success("Incremental rent data saved successfully.") 
 
-           
-			# 🔹 NEW CHILD EXPENSE LOGIC
+            # 🔹 NEW CHILD EXPENSE LOGIC
             elif entry_type == 'child_expense':
                 # Build a SQLAlchemy engine to read child_expense metadata
                 connection_string = (f"postgresql+psycopg2://{self.db_config['user']}:"
@@ -13969,7 +14908,7 @@ class ProjectionUpdater:
                     # -------------------------
 
                     projection_start = start_dt
-                    current_amount = base_amount
+                    current_amount = base_amount/12
 
                     while projection_start <= end_dt:
 
@@ -14010,7 +14949,7 @@ class ProjectionUpdater:
                         additional_income_expense_criteria_df, append=False
                     )
 
-                    st.success("Child expense applied successfully.")
+                    st.success("Child expense applied successfully.")                
 
             elif entry_type == 'stop':
                 self.save_additional_income_expense_criteria_df_to_db(additional_income_expense_criteria_df)
@@ -14157,7 +15096,8 @@ class ProjectionUpdater:
         df_transposed.reset_index(inplace=True)
         df_transposed.rename(columns={'index': 'entry_date'}, inplace=True)
         df_transposed.set_index('entry_date', inplace=True)  # Set asset_name as index
-        return df_transposed  
+        formatted_df = df_transposed.applymap(self.format_indian_number)
+        return formatted_df  
 
 
 
@@ -14230,8 +15170,8 @@ class ProjectionUpdater:
         # Reset the index to bring expense_category_name as a column for better readability
         reshaped_df = reshaped_df.reset_index()
         reshaped_df.set_index('expense_category_name', inplace=True)  # Set asset_name as index
-
-        return reshaped_df
+        formatted_df = reshaped_df.applymap(self.format_indian_number)
+        return formatted_df
     
     
     # Function to delete records with entry_date less than the current date
@@ -14674,9 +15614,9 @@ class ProjectionUpdater:
                 st.success("Range date update applied and save to the database.")
 
         elif entry_type == 'increment':
-            entry_date = st.date_input("Entry Date:", key="milestone_increment_entry")
+            entry_date = st.date_input("Entry Date:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="milestone_increment_entry")
             percentage = st.number_input("Increment percentage:", key="milestone_increment_percentage")
-            end_date_increment = st.date_input("End Date for Increment:",key="milestone_increment_end")
+            end_date_increment = st.date_input("End Date for Increment:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="milestone_increment_end")
             asset_name = st.selectbox("Select milestone name for increment:", unique_milestone_surplus_projections, key="milestone_increment_asset")
             if st.button("Apply Increment Update", key="apply_milestone_increment_update"):
                 milestone_withdrawal_projections_df = self.update_milestone_related_withdrawal_projections(user_id, milestone_withdrawal_projections_df, distinct_names=[a for a, _ in assets_with_categories], entry_type=entry_type, increment_params={'entry_date': entry_date.strftime('%Y-%m-%d'), 'percentage': percentage, 'end_date': end_date_increment.strftime('%Y-%m-%d'), 'asset_name': asset_name})
@@ -15065,28 +16005,65 @@ class ProjectionUpdater:
 
     def update_dynamic_yearly_cf_projections(self, dynamic_yearly_cf_projections_df, user_id):
 
-        dynamic_yearly_cf_projections_df['entry_date'] = pd.to_datetime(dynamic_yearly_cf_projections_df['entry_date'])
-        # Convert necessary columns to numeric (float) to avoid concatenation issues
-        dynamic_yearly_cf_projections_df['gross_income'] = pd.to_numeric(dynamic_yearly_cf_projections_df['gross_income'], errors='coerce')
-        dynamic_yearly_cf_projections_df['total_expense'] = pd.to_numeric(dynamic_yearly_cf_projections_df['total_expense'], errors='coerce')
-        dynamic_yearly_cf_projections_df['total_tax'] = pd.to_numeric(dynamic_yearly_cf_projections_df['total_tax'], errors='coerce')
-        dynamic_yearly_cf_projections_df['total_investment'] = pd.to_numeric(dynamic_yearly_cf_projections_df['total_investment'], errors='coerce')
-        dynamic_yearly_cf_projections_df['total_emi'] = pd.to_numeric(dynamic_yearly_cf_projections_df['total_emi'], errors='coerce')
-        
+        df = dynamic_yearly_cf_projections_df.copy()
 
+        # ------------------------------------------------------------------
+        # 1. Clean base DF – keep same structure, just fix types
+        # ------------------------------------------------------------------
+        df['entry_date'] = pd.to_datetime(df['entry_date']).dt.tz_localize(None)
+
+        # Columns you already use numerically
+        numeric_cols = [
+            'gross_income',
+            'total_expense',
+            'total_tax',
+            'total_investment',
+            'total_emi',
+            'total_liabilities',
+            'total_assets',
+            'total_liabilities_outflows',
+            'total_insurance_outflows',
+            'total_repayment',
+            'total_surplus_repayment',
+            'total_stp_investment',
+            'total_milestone_withdrawal',
+            'milestone_out_amt',
+            'total_surplus',
+            'beg_total_surplus',
+            'end_total_surplus',
+            'total_networth',
+            'end_total_surplus_difference',
+        ]
+
+        # Ensure all numeric columns exist & are float
+        for col in numeric_cols:
+            if col not in df.columns:
+                df[col] = 0.0
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(float)
+
+        # ------------------------------------------------------------------
+        # 2. Fetch all required tables from DB
+        # ------------------------------------------------------------------
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, gross_income, taxes, total_expense
             FROM dynamic_milestone_income_projection
             WHERE user_code = %s;
         """, (user_id,))
-
         yearly_cf_data = cursor.fetchall()
         cursor.close()
 
-        yearly_cf_df = pd.DataFrame(yearly_cf_data, columns=['entry_date', 'gross_income', 'taxes', 'total_expense'])
-        yearly_cf_df['entry_date'] = pd.to_datetime(yearly_cf_df['entry_date']).dt.tz_localize(None)
-        
+        yearly_cf_df = pd.DataFrame(
+            yearly_cf_data,
+            columns=['entry_date', 'gross_income', 'taxes', 'total_expense']
+        )
+        if not yearly_cf_df.empty:
+            yearly_cf_df['entry_date'] = pd.to_datetime(yearly_cf_df['entry_date']).dt.tz_localize(None)
+            yearly_cf_df['gross_income'] = pd.to_numeric(yearly_cf_df['gross_income'], errors='coerce').astype(float)
+            yearly_cf_df['taxes'] = pd.to_numeric(yearly_cf_df['taxes'], errors='coerce').astype(float)
+            yearly_cf_df['total_expense'] = pd.to_numeric(yearly_cf_df['total_expense'], errors='coerce').astype(float)
+
+        # Investment projections
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(asset_value::double precision) AS total_investment
@@ -15094,13 +16071,15 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         investment_data = cursor.fetchall()
         cursor.close()
 
         investment_df = pd.DataFrame(investment_data, columns=['entry_date', 'total_investment'])
-        investment_df['entry_date'] = pd.to_datetime(investment_df['entry_date']).dt.tz_localize(None)
+        if not investment_df.empty:
+            investment_df['entry_date'] = pd.to_datetime(investment_df['entry_date']).dt.tz_localize(None)
+            investment_df['total_investment'] = pd.to_numeric(investment_df['total_investment'], errors='coerce').astype(float)
 
+        # Liabilities projections
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(liabilities_value) AS total_liabilities
@@ -15108,13 +16087,15 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         liabilities_data = cursor.fetchall()
         cursor.close()
 
         liabilities_df = pd.DataFrame(liabilities_data, columns=['entry_date', 'total_liabilities'])
-        liabilities_df['entry_date'] = pd.to_datetime(liabilities_df['entry_date']).dt.tz_localize(None)
+        if not liabilities_df.empty:
+            liabilities_df['entry_date'] = pd.to_datetime(liabilities_df['entry_date']).dt.tz_localize(None)
+            liabilities_df['total_liabilities'] = pd.to_numeric(liabilities_df['total_liabilities'], errors='coerce').astype(float)
 
+        # Assets projections
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(assets_value) AS total_assets
@@ -15122,13 +16103,15 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         assets_data = cursor.fetchall()
         cursor.close()
 
         assets_df = pd.DataFrame(assets_data, columns=['entry_date', 'total_assets'])
-        assets_df['entry_date'] = pd.to_datetime(assets_df['entry_date']).dt.tz_localize(None)
+        if not assets_df.empty:
+            assets_df['entry_date'] = pd.to_datetime(assets_df['entry_date']).dt.tz_localize(None)
+            assets_df['total_assets'] = pd.to_numeric(assets_df['total_assets'], errors='coerce').astype(float)
 
+        # Liabilities outflows
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(liabilities_value::double precision) AS total_liabilities_outflows
@@ -15136,13 +16119,20 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         liabilities_outflows_data = cursor.fetchall()
         cursor.close()
 
-        liabilities_outflows_df = pd.DataFrame(liabilities_outflows_data, columns=['entry_date', 'total_liabilities_outflows'])
-        liabilities_outflows_df['entry_date'] = pd.to_datetime(liabilities_outflows_df['entry_date']).dt.tz_localize(None)
+        liabilities_outflows_df = pd.DataFrame(
+            liabilities_outflows_data,
+            columns=['entry_date', 'total_liabilities_outflows']
+        )
+        if not liabilities_outflows_df.empty:
+            liabilities_outflows_df['entry_date'] = pd.to_datetime(liabilities_outflows_df['entry_date']).dt.tz_localize(None)
+            liabilities_outflows_df['total_liabilities_outflows'] = pd.to_numeric(
+                liabilities_outflows_df['total_liabilities_outflows'], errors='coerce'
+            ).astype(float)
 
+        # Insurance outflows
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(insurance_value::double precision) AS total_insurance_outflows
@@ -15150,14 +16140,20 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         insurance_outflows_data = cursor.fetchall()
         cursor.close()
 
-        insurance_outflows_df = pd.DataFrame(insurance_outflows_data, columns=['entry_date', 'total_insurance_outflows'])
-        insurance_outflows_df['entry_date'] = pd.to_datetime(insurance_outflows_df['entry_date']).dt.tz_localize(None)
+        insurance_outflows_df = pd.DataFrame(
+            insurance_outflows_data,
+            columns=['entry_date', 'total_insurance_outflows']
+        )
+        if not insurance_outflows_df.empty:
+            insurance_outflows_df['entry_date'] = pd.to_datetime(insurance_outflows_df['entry_date']).dt.tz_localize(None)
+            insurance_outflows_df['total_insurance_outflows'] = pd.to_numeric(
+                insurance_outflows_df['total_insurance_outflows'], errors='coerce'
+            ).astype(float)
 
-
+        # Loan repayment
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(liabilities_value::double precision) AS total_repayment
@@ -15165,13 +16161,15 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         repayment_data = cursor.fetchall()
         cursor.close()
 
         repayment_df = pd.DataFrame(repayment_data, columns=['entry_date', 'total_repayment'])
-        repayment_df['entry_date'] = pd.to_datetime(repayment_df['entry_date']).dt.tz_localize(None) 
+        if not repayment_df.empty:
+            repayment_df['entry_date'] = pd.to_datetime(repayment_df['entry_date']).dt.tz_localize(None)
+            repayment_df['total_repayment'] = pd.to_numeric(repayment_df['total_repayment'], errors='coerce').astype(float)
 
+        # Surplus repayment
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(liabilities_value::double precision) AS total_surplus_repayment
@@ -15179,13 +16177,20 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         surplus_repayment_data = cursor.fetchall()
         cursor.close()
 
-        surplus_repayment_df = pd.DataFrame(surplus_repayment_data, columns=['entry_date', 'total_surplus_repayment'])
-        surplus_repayment_df['entry_date'] = pd.to_datetime(surplus_repayment_df['entry_date']).dt.tz_localize(None) 
+        surplus_repayment_df = pd.DataFrame(
+            surplus_repayment_data,
+            columns=['entry_date', 'total_surplus_repayment']
+        )
+        if not surplus_repayment_df.empty:
+            surplus_repayment_df['entry_date'] = pd.to_datetime(surplus_repayment_df['entry_date']).dt.tz_localize(None)
+            surplus_repayment_df['total_surplus_repayment'] = pd.to_numeric(
+                surplus_repayment_df['total_surplus_repayment'], errors='coerce'
+            ).astype(float)
 
+        # STP investment
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(asset_value::double precision) AS total_stp_investment
@@ -15193,13 +16198,17 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         stp_investment_data = cursor.fetchall()
         cursor.close()
 
         stp_investment_df = pd.DataFrame(stp_investment_data, columns=['entry_date', 'total_stp_investment'])
-        stp_investment_df['entry_date'] = pd.to_datetime(stp_investment_df['entry_date']).dt.tz_localize(None)
+        if not stp_investment_df.empty:
+            stp_investment_df['entry_date'] = pd.to_datetime(stp_investment_df['entry_date']).dt.tz_localize(None)
+            stp_investment_df['total_stp_investment'] = pd.to_numeric(
+                stp_investment_df['total_stp_investment'], errors='coerce'
+            ).astype(float)
 
+        # Milestone withdrawal (from surplus_withdrawal_projections)
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(asset_value::double precision) AS total_milestone_withdrawal
@@ -15207,13 +16216,20 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         milestone_withdrawal_data = cursor.fetchall()
         cursor.close()
 
-        milestone_withdrawal_df = pd.DataFrame(milestone_withdrawal_data, columns=['entry_date', 'total_milestone_withdrawal'])
-        milestone_withdrawal_df['entry_date'] = pd.to_datetime(milestone_withdrawal_df['entry_date']).dt.tz_localize(None) 
+        milestone_withdrawal_df = pd.DataFrame(
+            milestone_withdrawal_data,
+            columns=['entry_date', 'total_milestone_withdrawal']
+        )
+        if not milestone_withdrawal_df.empty:
+            milestone_withdrawal_df['entry_date'] = pd.to_datetime(milestone_withdrawal_df['entry_date']).dt.tz_localize(None)
+            milestone_withdrawal_df['total_milestone_withdrawal'] = pd.to_numeric(
+                milestone_withdrawal_df['total_milestone_withdrawal'], errors='coerce'
+            ).astype(float)
 
+        # Milestone outflow amount (from milestone_calculation_projections)
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT entry_date, SUM(milestone_value::double precision) AS milestone_out_amt
@@ -15221,134 +16237,139 @@ class ProjectionUpdater:
             WHERE user_code = %s
             GROUP BY entry_date;
         """, (user_id,))
-
         milestone_out_amt_data = cursor.fetchall()
         cursor.close()
 
-        milestone_out_amt_df = pd.DataFrame(milestone_out_amt_data, columns=['entry_date', 'milestone_out_amt'])
-        milestone_out_amt_df['entry_date'] = pd.to_datetime(milestone_out_amt_df['entry_date']).dt.tz_localize(None) 
+        milestone_out_amt_df = pd.DataFrame(
+            milestone_out_amt_data,
+            columns=['entry_date', 'milestone_out_amt']
+        )
+        if not milestone_out_amt_df.empty:
+            milestone_out_amt_df['entry_date'] = pd.to_datetime(milestone_out_amt_df['entry_date']).dt.tz_localize(None)
+            milestone_out_amt_df['milestone_out_amt'] = pd.to_numeric(
+                milestone_out_amt_df['milestone_out_amt'], errors='coerce'
+            ).astype(float)
 
-        
-        for idx, projection in dynamic_yearly_cf_projections_df.iterrows():
-            matching_row = yearly_cf_df[(yearly_cf_df['entry_date'] == projection['entry_date'])]
-            #print('matching_row',matching_row)
-            if not matching_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'gross_income'] = matching_row['gross_income'].values[0]
-                dynamic_yearly_cf_projections_df.at[idx, 'total_tax'] = matching_row['taxes'].values[0]
-                dynamic_yearly_cf_projections_df.at[idx, 'total_expense'] = matching_row['total_expense'].values[0]
+        # ------------------------------------------------------------------
+        # 3. Row-wise update (your original logic, preserved)
+        # ------------------------------------------------------------------
+        df = df.sort_values('entry_date').reset_index(drop=True)
 
-            matching_investment_row = investment_df[(investment_df['entry_date'] == projection['entry_date'])]
+        for idx, projection in df.iterrows():
+            current_date = projection['entry_date']
 
-            if not matching_investment_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_investment'] = matching_investment_row['total_investment'].values[0]
+            # Income row
+            matching_row = yearly_cf_df[yearly_cf_df['entry_date'] == current_date] if not yearly_cf_df.empty else None
+            if matching_row is not None and not matching_row.empty:
+                df.at[idx, 'gross_income'] = float(matching_row['gross_income'].values[0] or 0)
+                df.at[idx, 'total_tax'] = float(matching_row['taxes'].values[0] or 0)
+                df.at[idx, 'total_expense'] = float(matching_row['total_expense'].values[0] or 0)
 
-            matching_liabilities_row = liabilities_df[(liabilities_df['entry_date'] == projection['entry_date'])]
+            # Investment
+            matching_investment_row = investment_df[investment_df['entry_date'] == current_date] if not investment_df.empty else None
+            if matching_investment_row is not None and not matching_investment_row.empty:
+                df.at[idx, 'total_investment'] = float(matching_investment_row['total_investment'].values[0] or 0)
 
-            if not matching_liabilities_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_liabilities'] = matching_liabilities_row['total_liabilities'].values[0]
+            # Liabilities
+            matching_liabilities_row = liabilities_df[liabilities_df['entry_date'] == current_date] if not liabilities_df.empty else None
+            if matching_liabilities_row is not None and not matching_liabilities_row.empty:
+                df.at[idx, 'total_liabilities'] = float(matching_liabilities_row['total_liabilities'].values[0] or 0)
 
-            matching_assets_row = assets_df[(assets_df['entry_date'] == projection['entry_date'])]
+            # Assets
+            matching_assets_row = assets_df[assets_df['entry_date'] == current_date] if not assets_df.empty else None
+            if matching_assets_row is not None and not matching_assets_row.empty:
+                df.at[idx, 'total_assets'] = float(matching_assets_row['total_assets'].values[0] or 0)
 
-            if not matching_assets_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_assets'] = matching_assets_row['total_assets'].values[0]
+            # Liabilities outflows
+            matching_liabilities_outflows_row = liabilities_outflows_df[liabilities_outflows_df['entry_date'] == current_date] if not liabilities_outflows_df.empty else None
+            if matching_liabilities_outflows_row is not None and not matching_liabilities_outflows_row.empty:
+                df.at[idx, 'total_liabilities_outflows'] = float(matching_liabilities_outflows_row['total_liabilities_outflows'].values[0] or 0)
 
-            matching_liabilities_outflows_row = liabilities_outflows_df[(liabilities_outflows_df['entry_date'] == projection['entry_date'])]
+            # Insurance outflows
+            matching_insurance_outflows_row = insurance_outflows_df[insurance_outflows_df['entry_date'] == current_date] if not insurance_outflows_df.empty else None
+            if matching_insurance_outflows_row is not None and not matching_insurance_outflows_row.empty:
+                df.at[idx, 'total_insurance_outflows'] = float(matching_insurance_outflows_row['total_insurance_outflows'].values[0] or 0)
 
-            if not matching_liabilities_outflows_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_liabilities_outflows'] = matching_liabilities_outflows_row['total_liabilities_outflows'].values[0]
+            # Repayment
+            matching_repayment_row = repayment_df[repayment_df['entry_date'] == current_date] if not repayment_df.empty else None
+            if matching_repayment_row is not None and not matching_repayment_row.empty:
+                df.at[idx, 'total_repayment'] = float(matching_repayment_row['total_repayment'].values[0] or 0)
 
-            matching_insurance_outflows_row = insurance_outflows_df[(insurance_outflows_df['entry_date'] == projection['entry_date'])]
+            # Surplus repayment
+            matching_surplus_repayment_row = surplus_repayment_df[surplus_repayment_df['entry_date'] == current_date] if not surplus_repayment_df.empty else None
+            if matching_surplus_repayment_row is not None and not matching_surplus_repayment_row.empty:
+                df.at[idx, 'total_surplus_repayment'] = float(matching_surplus_repayment_row['total_surplus_repayment'].values[0] or 0)
 
-            if not matching_insurance_outflows_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_insurance_outflows'] = matching_insurance_outflows_row['total_insurance_outflows'].values[0]
+            # STP investment
+            matching_stp_investment_row = stp_investment_df[stp_investment_df['entry_date'] == current_date] if not stp_investment_df.empty else None
+            if matching_stp_investment_row is not None and not matching_stp_investment_row.empty:
+                df.at[idx, 'total_stp_investment'] = float(matching_stp_investment_row['total_stp_investment'].values[0] or 0)
 
+            # Milestone withdrawal (bug fixed: check correct matching df)
+            matching_milestone_withdrawal_row = milestone_withdrawal_df[milestone_withdrawal_df['entry_date'] == current_date] if not milestone_withdrawal_df.empty else None
+            if matching_milestone_withdrawal_row is not None and not matching_milestone_withdrawal_row.empty:
+                df.at[idx, 'total_milestone_withdrawal'] = float(matching_milestone_withdrawal_row['total_milestone_withdrawal'].values[0] or 0)
 
-            matching_repayment_row = repayment_df[(repayment_df['entry_date'] == projection['entry_date'])]
+            # Milestone out amount
+            matching_milestone_out_amt_row = milestone_out_amt_df[milestone_out_amt_df['entry_date'] == current_date] if not milestone_out_amt_df.empty else None
+            if matching_milestone_out_amt_row is not None and not matching_milestone_out_amt_row.empty:
+                df.at[idx, 'milestone_out_amt'] = float(matching_milestone_out_amt_row['milestone_out_amt'].values[0] or 0)
 
-            if not matching_repayment_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_repayment'] = matching_repayment_row['total_repayment'].values[0] 
+            # --- Calculations (same as your original logic) ---
+            gross_income = float(df.at[idx, 'gross_income'] or 0)
+            total_expense = float(df.at[idx, 'total_expense'] or 0)
+            total_tax = float(df.at[idx, 'total_tax'] or 0)
+            total_investment = float(df.at[idx, 'total_investment'] or 0)
+            total_liabilities_outflows = float(df.at[idx, 'total_liabilities_outflows'] or 0)
+            total_insurance_outflows = float(df.at[idx, 'total_insurance_outflows'] or 0)
+            total_repayment = float(df.at[idx, 'total_repayment'] or 0)
+            total_surplus_repayment = float(df.at[idx, 'total_surplus_repayment'] or 0)
+            total_stp_investment = float(df.at[idx, 'total_stp_investment'] or 0)
+            total_milestone_withdrawal = float(df.at[idx, 'total_milestone_withdrawal'] or 0)
+            total_milestone_out_amt = float(df.at[idx, 'milestone_out_amt'] or 0)
 
-
-            matching_surplus_repayment_row = surplus_repayment_df[(surplus_repayment_df['entry_date'] == projection['entry_date'])]
-
-            if not matching_surplus_repayment_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_surplus_repayment'] = matching_surplus_repayment_row['total_surplus_repayment'].values[0]
-
-
-            matching_stp_investment_row = stp_investment_df[(stp_investment_df['entry_date'] == projection['entry_date'])]
-
-            if not matching_stp_investment_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_stp_investment'] = matching_stp_investment_row['total_stp_investment'].values[0]         
-
-
-            matching_milestone_withdrawal_row = milestone_withdrawal_df[(milestone_withdrawal_df['entry_date'] == projection['entry_date'])]
-
-            if not matching_repayment_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'total_milestone_withdrawal'] = matching_milestone_withdrawal_row['total_milestone_withdrawal'].values[0] 
-
-
-            matching_milestone_out_amt_row = milestone_out_amt_df[(milestone_out_amt_df['entry_date'] == projection['entry_date'])]
-
-            if not matching_milestone_out_amt_row.empty:
-                dynamic_yearly_cf_projections_df.at[idx, 'milestone_out_amt'] = matching_milestone_out_amt_row['milestone_out_amt'].values[0]     
-
-
-
-            gross_income = float(dynamic_yearly_cf_projections_df.at[idx, 'gross_income'] or 0)
-            total_expense = float(dynamic_yearly_cf_projections_df.at[idx, 'total_expense'] or 0)
-            total_tax = float(dynamic_yearly_cf_projections_df.at[idx, 'total_tax'] or 0)
-            total_investment = float(dynamic_yearly_cf_projections_df.at[idx, 'total_investment'] or 0)
-            total_liabilities_outflows = float(dynamic_yearly_cf_projections_df.at[idx, 'total_liabilities_outflows'] or 0)
-            total_insurance_outflows = float(dynamic_yearly_cf_projections_df.at[idx, 'total_insurance_outflows'] or 0)
-            total_repayment = float(dynamic_yearly_cf_projections_df.at[idx, 'total_repayment'] or 0)
-            total_surplus_repayment = float(dynamic_yearly_cf_projections_df.at[idx, 'total_surplus_repayment'] or 0)
-            total_stp_investment = float(dynamic_yearly_cf_projections_df.at[idx, 'total_stp_investment'] or 0)
-            total_milestone_withdrawal = float(dynamic_yearly_cf_projections_df.at[idx, 'total_milestone_withdrawal'] or 0)
-            total_milestone_out_amt = float(dynamic_yearly_cf_projections_df.at[idx, 'milestone_out_amt'] or 0)
-            
-
-            total_emi = total_liabilities_outflows + total_insurance_outflows 
-            dynamic_yearly_cf_projections_df.at[idx, 'total_emi'] = total_emi
+            total_emi = total_liabilities_outflows + total_insurance_outflows
+            df.at[idx, 'total_emi'] = total_emi
 
             total_surplus = gross_income + total_expense + total_tax + total_investment + total_emi
-            dynamic_yearly_cf_projections_df.at[idx, 'total_surplus'] = total_surplus
+            df.at[idx, 'total_surplus'] = total_surplus
 
             if idx == 0:
                 beg_total_surplus = total_surplus
             else:
-                #st.write('previous end_total_surplus', dynamic_yearly_cf_projections_df.at[idx - 1, 'end_total_surplus'] )
-                #st.write('in loop current total surplus',total_surplus)
-                beg_total_surplus = (dynamic_yearly_cf_projections_df.at[idx - 1, 'end_total_surplus'] + total_surplus)
+                beg_total_surplus = float(df.at[idx - 1, 'end_total_surplus'] or 0) + total_surplus
 
-            end_total_surplus = beg_total_surplus + total_repayment + total_surplus_repayment  - total_milestone_withdrawal - total_milestone_out_amt
+            end_total_surplus = (
+                beg_total_surplus
+                + total_repayment
+                + total_surplus_repayment
+                - total_milestone_withdrawal
+                - total_milestone_out_amt
+            )
 
-            # st.write('idx',idx)
-            # st.write('total_surplus',total_surplus)
-            # st.write('beg_total_surplus',beg_total_surplus)
-            # st.write('end_total_surplus',end_total_surplus)
-            # st.write('----------------------------------------------------------------')
+            df.at[idx, 'beg_total_surplus'] = beg_total_surplus
+            df.at[idx, 'end_total_surplus'] = end_total_surplus
 
-            dynamic_yearly_cf_projections_df.at[idx, 'beg_total_surplus'] = beg_total_surplus
-            dynamic_yearly_cf_projections_df.at[idx, 'end_total_surplus'] = end_total_surplus
-
-            total_liabilities = dynamic_yearly_cf_projections_df.at[idx, 'total_liabilities']
-            total_assets = dynamic_yearly_cf_projections_df.at[idx, 'total_assets']
-
+            total_liabilities = float(df.at[idx, 'total_liabilities'] or 0)
+            total_assets = float(df.at[idx, 'total_assets'] or 0)
             total_networth = total_assets - total_liabilities
-            dynamic_yearly_cf_projections_df.at[idx, 'total_networth'] = total_networth
+            df.at[idx, 'total_networth'] = total_networth
 
-            # Calculate end_total_surplus_difference and store it at the next entry_date
-            dynamic_yearly_cf_projections_df['end_total_surplus_difference'] = None  # Initialize the column
+        # ------------------------------------------------------------------
+        # 4. end_total_surplus_difference – same logic, but calculated once
+        # ------------------------------------------------------------------
+        df['end_total_surplus_difference'] = df['end_total_surplus'].diff()
+        df['end_total_surplus_difference'] = df['end_total_surplus_difference'].fillna(0.0).astype(float)
 
-            for i in range(1, len(dynamic_yearly_cf_projections_df)):
-                prev_surplus = dynamic_yearly_cf_projections_df.at[i - 1, 'end_total_surplus']
-                current_surplus = dynamic_yearly_cf_projections_df.at[i, 'end_total_surplus']
-                surplus_diff = current_surplus - prev_surplus
+        # Make sure all numeric columns are float (kill Decimal once & for all)
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(float)
 
-                # Store the difference at the current index (i)
-                dynamic_yearly_cf_projections_df.at[i, 'end_total_surplus_difference'] = surplus_diff
+        # Return with same structure (no column ordering changed)
+        return df
 
-        return dynamic_yearly_cf_projections_df
+
 
     def save_dynamic_yearly_cf_projections_df_to_db(self, dynamic_yearly_cf_projections_df):
         # Ensure all integer types are converted to Python's built-in int
@@ -15438,7 +16459,8 @@ class ProjectionUpdater:
         df_transposed.reset_index(inplace=True)
         df_transposed.rename(columns={'index': 'entry_date'}, inplace=True)
         df_transposed.set_index('entry_date', inplace=True)  # Set asset_name as index
-        return df_transposed
+        formatted_df = df_transposed.applymap(self.format_indian_number)
+        return formatted_df
 
 
     # Method to transpose the dynamic_yearly_cf_projections_df data
@@ -15544,7 +16566,7 @@ class ProjectionUpdater:
                 'age': iter_age,
                 'equity': 0,
                 'real_estate': 0,
-                'passive_income': 0,
+                'commodity': 0,
                 'debt': 0,
                 'alternate_investments': 0,
                 'good_liabilities_to_total_assets': 0,
@@ -15594,7 +16616,7 @@ class ProjectionUpdater:
         cursor = connection.cursor()
         cursor.execute("""
             SELECT SUM(coverage) AS total_health_insurance
-            FROM insurance
+            FROM milestone_insurance
             WHERE user_code = %s AND category_id = 64 AND is_active = true;
         """, (user_id,))
         total_health_insurance = cursor.fetchone()[0]
@@ -15602,7 +16624,7 @@ class ProjectionUpdater:
         # Fetch life insurance coverage for all entry_date
         cursor.execute("""
             SELECT sum(coverage) AS total_life_insurance
-            FROM insurance
+            FROM milestone_insurance
             WHERE user_code = %s AND  (category_id = 101 or category_id = 102 or category_id = 228 or category_id = 231 ) AND is_active = true;
         """, (user_id,))
         total_life_insurance = cursor.fetchone()[0]
@@ -15623,7 +16645,7 @@ class ProjectionUpdater:
 
         # Ensure numeric columns are of the correct type
         numeric_columns = [
-            'equity', 'real_estate', 'passive_income', 'debt', 'alternate_investments',
+            'equity', 'real_estate', 'commodity', 'debt', 'alternate_investments',
             'good_liabilities_to_total_assets', 'bad_liabilities_to_total_assets', 'expense_to_income',
             'good_liability_linked_emi_to_income', 'bad_liability_linked_emi_to_income', 'investment_to_income',
             'emergency_funds', 'health_insurance', 'life_insurance'
@@ -15912,7 +16934,7 @@ class ProjectionUpdater:
         cursor.execute("""
             SELECT entry_date, SUM(assets_value::double precision) AS total_real_estate_1
             FROM dynamic_assets_projections
-            WHERE user_code = %s AND category_id IN (31, 32, 57,609,616, 628,604,33,642) 
+            WHERE user_code = %s AND category_id IN (31, 32, 57,609,616, 628,604,33,642, 29,30,236,627,631,634) 
             GROUP BY entry_date;
         """, (user_id,))
 
@@ -15946,7 +16968,7 @@ class ProjectionUpdater:
         cursor.execute("""
             SELECT entry_date, SUM(assets_value::double precision) AS total_passive_income_1
             FROM dynamic_assets_projections
-            WHERE user_code = %s AND category_id IN (29,30,236,627,631,634)
+            WHERE user_code = %s AND category_id IN (329, 337, 35, 34, 90, 91, 36)
             GROUP BY entry_date;
         """, (user_id,))
 
@@ -16083,7 +17105,7 @@ class ProjectionUpdater:
         cursor.execute("""
             SELECT entry_date, SUM(assets_value::double precision) AS total_alternate_investments
             FROM dynamic_assets_projections
-            WHERE user_code = %s AND category_id IN (25, 34, 35, 36, 50, 51, 53, 90, 91, 238, 329, 337)
+            WHERE user_code = %s AND category_id IN (25, 50, 51, 53, 238)
             GROUP BY entry_date;
         """, (user_id,))
 
@@ -16384,7 +17406,7 @@ class ProjectionUpdater:
             else:
                 passive_income = 0
 
-            dynamic_actual_projections_df.at[idx, 'passive_income'] = passive_income    
+            dynamic_actual_projections_df.at[idx, 'commodity'] = passive_income    
 
             # Debt calculation
             matching_debt_row = debt_df[debt_df['entry_date'] == current_entry_date]
@@ -16450,7 +17472,7 @@ class ProjectionUpdater:
             'age': BIGINT,
             'equity': NUMERIC,
             'real_estate': NUMERIC,
-            'passive_income': NUMERIC,
+            'commodity': NUMERIC,
             'debt': NUMERIC,
             'alternate_investments': NUMERIC,
             'good_liabilities_to_total_assets': NUMERIC,
@@ -16545,21 +17567,76 @@ class ProjectionUpdater:
         return df_transposed 
     
     # Method to transpose the dynamic_yearly_cf_projections_df data
-    def transpose_display_dynamic_actual_projections_df_1(self, dynamic_actual_projections_df):
-        # Drop unnecessary columns
-        dynamic_actual_projections_df = dynamic_actual_projections_df.drop(columns=['user_code', 'user_name'])
 
-        # Ensure entry_date is in string format
-        dynamic_actual_projections_df['entry_date'] = dynamic_actual_projections_df['entry_date'].dt.strftime('%d-%m-%Y')
-        
-        # Transpose the table
-        df_transposed = dynamic_actual_projections_df.set_index('entry_date').T
-        
-        # Reset index and rename the index column
+    def transpose_display_dynamic_actual_projections_df_1( self, dynamic_actual_projections_df):
+        # --------------------------------------------------
+        # 1. Drop unnecessary columns
+        # --------------------------------------------------
+        df = dynamic_actual_projections_df.drop(columns=['user_code', 'user_name'])
+
+        # --------------------------------------------------
+        # 2. Format entry_date
+        # --------------------------------------------------
+        df['entry_date'] = df['entry_date'].dt.strftime('%d-%m-%Y')
+
+        # --------------------------------------------------
+        # 3. Percentage-based columns
+        # --------------------------------------------------
+        percentage_columns = {
+            'equity',
+            'real_estate',
+            'commodity',
+            'debt',
+            'alternate_investments',
+            'good_liabilities_to_total_assets',
+            'bad_liabilities_to_total_assets',
+            'expense_to_income',
+            'good_liability_linked_emi_to_income',
+            'bad_liability_linked_emi_to_income',
+            'investment_to_income'
+        }
+
+        # --------------------------------------------------
+        # 4. Indian-number formatted columns
+        # --------------------------------------------------
+        indian_number_columns = {
+            'emergency_funds',
+            'health_insurance',
+            'life_insurance'
+        }
+
+        # --------------------------------------------------
+        # 5. Apply percentage formatting
+        # --------------------------------------------------
+        for col in percentage_columns:
+            if col in df.columns:
+                df[col] = df[col].apply(
+                    lambda x: f"{int(round(x * 100))}%" if pd.notna(x) else ""
+                )
+
+        # --------------------------------------------------
+        # 6. Apply Indian number formatting
+        # --------------------------------------------------
+        for col in indian_number_columns:
+            if col in df.columns:
+                df[col] = df[col].apply(self.format_indian_number)
+
+        # --------------------------------------------------
+        # 7. Transpose
+        # --------------------------------------------------
+        df_transposed = df.set_index('entry_date').T
+
+        # --------------------------------------------------
+        # 8. Final formatting
+        # --------------------------------------------------
         df_transposed.reset_index(inplace=True)
         df_transposed.rename(columns={'index': 'entry_date'}, inplace=True)
-        df_transposed.set_index('entry_date', inplace=True)  # Set asset_name as index 
+        df_transposed.set_index('entry_date', inplace=True)
+
         return df_transposed
+
+
+
         
 
     def delete_old_actual_projections_with_milestones_records(self):
@@ -16723,7 +17800,7 @@ class ProjectionUpdater:
             'age': BIGINT,
             'equity': NUMERIC,
             'real_estate': NUMERIC,
-            'passive_income_assets': NUMERIC,
+            'commodity': NUMERIC,
             'debt': NUMERIC,
             'alternative_investments': NUMERIC,
             'good_liabilities_to_total_assets': NUMERIC,
@@ -16789,18 +17866,40 @@ class ProjectionUpdater:
 
         return df_transposed
     
-    # Method to transpose the dynamic_ideal_projection_calculation data
-    def transpose_display_dynamic_ideal_projection_calculation_1(self, dynamic_ideal_projection_calculation):
-        # Drop unnecessary columns
-        dynamic_ideal_projection_calculation = dynamic_ideal_projection_calculation.drop(columns=['user_code'])
-        # Transpose the table
-        df_transposed = dynamic_ideal_projection_calculation.set_index('entry_date').T
-        
-        # Reset index and rename the index column
+
+    def transpose_display_dynamic_ideal_projection_calculation_1(self,dynamic_ideal_projection_calculation):
+        # --------------------------------------------------
+        # 1. Drop unnecessary columns
+        # --------------------------------------------------
+        df = dynamic_ideal_projection_calculation.drop(columns=['user_code'])
+
+        # --------------------------------------------------
+        # 2. Transpose
+        # --------------------------------------------------
+        df_transposed = df.set_index('entry_date').T
+
+        # --------------------------------------------------
+        # 3. Convert decimal → percentage (rounded)
+        # --------------------------------------------------
+        def to_percentage(val):
+            if pd.isna(val):
+                return ""
+            try:
+                return f"{int(round(val * 100))}%"
+            except Exception:
+                return val
+
+        df_transposed = df_transposed.applymap(to_percentage)
+
+        # --------------------------------------------------
+        # 4. Reset index for display
+        # --------------------------------------------------
         df_transposed.reset_index(inplace=True)
         df_transposed.rename(columns={'index': 'entry_date'}, inplace=True)
-        df_transposed.set_index('entry_date', inplace=True)  # Set asset_name as index
+        df_transposed.set_index('entry_date', inplace=True)
+
         return df_transposed
+
 
         
     def run_dynamic_ideal_projection_calculation(self, user_code, effective_tax_rate=None, appraisal_end_date=None):
@@ -16912,7 +18011,7 @@ class ProjectionUpdater:
             'age': BIGINT,
             'equity': NUMERIC,
             'real_estate': NUMERIC,
-            'passive_income_assets': NUMERIC,
+            'commodity': NUMERIC,
             'debt': NUMERIC,
             'alternative_investments': NUMERIC,
             'good_liabilities_to_total_assets': NUMERIC,
@@ -17074,7 +18173,7 @@ class ProjectionUpdater:
             'age': BIGINT,
             'equity': NUMERIC,
             'real_estate': NUMERIC,
-            'passive_income_assets': NUMERIC,
+            'commodity': NUMERIC,
             'debt': NUMERIC,
             'alternative_investments': NUMERIC,
             'good_liabilities_to_total_assets': NUMERIC,
@@ -17229,7 +18328,7 @@ class ProjectionUpdater:
         cursor = connection.cursor()
         cursor.execute("""
             SELECT SUM(cover) AS total_health_insurance
-            FROM pmwell_response
+            FROM milestone_pmwell_response
             WHERE user_code = %s AND category_id = 165 AND is_active = True;
         """, (user_id,))
         total_health_insurance = cursor.fetchone()[0]
@@ -17237,7 +18336,7 @@ class ProjectionUpdater:
         # Fetch life insurance coverage for all entry_date
         cursor.execute("""
             SELECT SUM(cover) AS total_life_insurance
-            FROM pmwell_response
+            FROM milestone_pmwell_response
             WHERE user_code = %s AND category_id = 166 AND is_active = True;
         """, (user_id,))
         total_life_insurance = cursor.fetchone()[0]
@@ -17391,7 +18490,8 @@ class ProjectionUpdater:
         df_transposed.reset_index(inplace=True)
         df_transposed.rename(columns={'index': 'entry_date'}, inplace=True)
         df_transposed.set_index('entry_date', inplace=True)
-        return df_transposed    
+        formatted_df = df_transposed.applymap(self.format_indian_number)
+        return formatted_df    
     
 
     # Method to transpose the dynamic_ideal_projections_emergency_planning_df data
@@ -17494,7 +18594,7 @@ class ProjectionUpdater:
                 'age': iter_age,
                 'equity': 0,
                 'real_estate': 0,
-                'passive_income': 0,
+                'commodity': 0,
                 'debt': 0,
                 'alternate_investments': 0,
                 'good_liabilities_to_total_assets': 0,
@@ -17534,7 +18634,7 @@ class ProjectionUpdater:
         cursor.execute("""
             SELECT entry_date, good_liabilities_to_total_assets, bad_liabilities_to_total_assets, expense_to_income,
                    good_liability_linked_emi_to_income, bad_liability_linked_emi_to_income, investment_to_income,
-                   equity, real_estate, passive_income, debt, alternate_investments, emergency_funds, health_insurance, life_insurance
+                   equity, real_estate, commodity, debt, alternate_investments, emergency_funds, health_insurance, life_insurance
             FROM actual_projections_with_milestones
             WHERE user_code = %s;
         """, (user_id,))
@@ -17559,7 +18659,7 @@ class ProjectionUpdater:
         cursor.execute("""
             SELECT entry_date, good_liabilities_to_total_assets, bad_liabilities_to_total_assets, expense_to_income,
                    good_liability_linked_emi_to_income, bad_liability_linked_emi_to_income, investment_to_income,
-                   equity, real_estate, passive_income_assets, debt, alternative_investments
+                   equity, real_estate, commodity, debt, alternative_investments
             FROM dynamic_ideal_projection_calculation
             WHERE user_code = %s;
         """, (user_id,))
@@ -17571,7 +18671,7 @@ class ProjectionUpdater:
         ideal_df = pd.DataFrame(ideal_data, columns=['entry_date', 'ideal_good_liabilities_to_total_assets', 'ideal_bad_liabilities_to_total_assets',
                                                      'ideal_expense_to_income', 'ideal_good_liability_linked_emi_to_income', 
                                                      'ideal_bad_liability_linked_emi_to_income', 'ideal_investment_to_income',
-                                                     'ideal_equity', 'ideal_real_estate', 'ideal_passive_income_assets', 
+                                                     'ideal_equity', 'ideal_real_estate', 'ideal_passive_income', 
                                                      'ideal_debt', 'ideal_alternative_investments'])
         ideal_df['entry_date'] = pd.to_datetime(ideal_df['entry_date']).dt.tz_localize(None)
         
@@ -17769,18 +18869,18 @@ class ProjectionUpdater:
 
                 #passive income                                 
                 actual_passive_income = float(matching_actual_row['actual_passive_income'].values[0])
-                ideal_passive_income = float(matching_ideal_row['ideal_passive_income_assets'].values[0])
+                ideal_passive_income = float(matching_ideal_row['ideal_passive_income'].values[0])
 
                 if actual_passive_income <= ideal_passive_income:
-                    passive_income = 100 - ((100 - 50) / (ideal_passive_income - 0) / 100) * (ideal_passive_income - actual_passive_income) * 100
+                    commodity = 100 - ((100 - 50) / (ideal_passive_income - 0) / 100) * (ideal_passive_income - actual_passive_income) * 100
                 else:
-                    passive_income = 100 - ((100 - 0) / (1 - ideal_passive_income) / 100) * ( actual_passive_income - ideal_passive_income) * 100
+                    commodity = 100 - ((100 - 0) / (1 - ideal_passive_income) / 100) * ( actual_passive_income - ideal_passive_income) * 100
 
                 # Ensure that the value is not negative
-                passive_income = max(passive_income, 0)
+                commodity = max(commodity, 0)
 
                 # Update the DataFrame
-                dynamic_fbs_projections_df.at[idx, 'passive_income'] = round(passive_income,0)
+                dynamic_fbs_projections_df.at[idx, 'commodity'] = round(commodity,0)
 
 
                 #Debt                                 
@@ -17878,7 +18978,7 @@ class ProjectionUpdater:
                 dynamic_fbs_projections_df.at[idx, 'investment_to_income'] = round(investments_to_income, 0)
                 dynamic_fbs_projections_df.at[idx, 'equity'] = round(equity, 0)
                 dynamic_fbs_projections_df.at[idx, 'real_estate'] = round(real_estate, 0)
-                dynamic_fbs_projections_df.at[idx, 'passive_income'] = round(passive_income, 0)
+                dynamic_fbs_projections_df.at[idx, 'commodity'] = round(commodity, 0)
                 dynamic_fbs_projections_df.at[idx, 'debt'] = round(debt, 0)
                 dynamic_fbs_projections_df.at[idx, 'alternate_investments'] = round(alternate_investment, 0)
                 dynamic_fbs_projections_df.at[idx, 'emergency_funds'] = round(emergency_funds, 0)
@@ -17889,7 +18989,7 @@ class ProjectionUpdater:
                 fbs = (ideal_weightage_a * ((good_liabilities_to_total_assets + bad_liabilities_to_total_assets + expense_to_income + 
                                              good_liability_linked_emi_to_income + bad_liability_linked_emi_to_income + 
                                              investments_to_income) / 6.0)) + \
-                      (ideal_weightage_b * ((equity + real_estate + passive_income + debt + alternate_investment) / 5.0)) + \
+                      (ideal_weightage_b * ((equity + real_estate + commodity + debt + alternate_investment) / 5.0)) + \
                       (ideal_weightage_c * ((emergency_funds + health_insurance + life_insurance) / 3.0))
 
                 # Update the DataFrame with the calculated FBS
@@ -17909,7 +19009,7 @@ class ProjectionUpdater:
             'age': BIGINT,
             'equity': NUMERIC,
             'real_estate': NUMERIC,
-            'passive_income': NUMERIC,
+            'commodity': NUMERIC,
             'debt': NUMERIC,
             'alternate_investments': NUMERIC,
             'good_liabilities_to_total_assets': NUMERIC,
@@ -18088,7 +19188,7 @@ class ProjectionUpdater:
         ideal_df.iloc[:, 2:] = ideal_df.iloc[:, 2:] * 100
 
         # Create a temporary DataFrame with renamed columns
-        ideal_df_temp = ideal_df.rename(columns={'passive_income_assets':'passive_income','alternative_investments': 'alternate_investments',
+        ideal_df_temp = ideal_df.rename(columns={'alternative_investments': 'alternate_investments',
                                                 'good_liability_to_total_assets' : 'good_liabilities_to_total_assets',
                                                 'bad_liability_to_total_assets' : 'bad_liabilities_to_total_assets',
                                                 'good_liability_emi_to_total_income':'good_liability_linked_emi_to_income',
@@ -18147,7 +19247,7 @@ class ProjectionUpdater:
         # Create subplots: 4 rows, 3 columns
         fig = make_subplots(rows=6, cols=2, subplot_titles=("Equity", 
                                                             "Real Estate", 
-                                                            "Passive Income",
+                                                            "Commodity",
                                                             "Debt",
                                                             "Alternate Investments",
                                                             "Good Liabilities to Total Assets",
@@ -18162,7 +19262,7 @@ class ProjectionUpdater:
 
         # Add other plots without repeating the legend
         add_projection_traces(fig, 'real_estate', 'real_estate', row=1, col=2, title='Real Estate', show_legend=False)
-        add_projection_traces(fig, 'passive_income', 'passive_income', row=2, col=1, title='Passive Income', show_legend=False)
+        add_projection_traces(fig, 'commodity', 'commodity', row=2, col=1, title='Commodity', show_legend=False)
         add_projection_traces(fig, 'debt', 'debt', row=2, col=2, title='Debt', show_legend=False)
         add_projection_traces(fig, 'alternate_investments', 'alternate_investments', row=3, col=1, title='Alternate Investments', show_legend=False)
         add_projection_traces(fig, 'good_liabilities_to_total_assets', 'good_liabilities_to_total_assets', row=3, col=2, title='Good Liabilities to Total Assets', show_legend=False)
@@ -18232,7 +19332,7 @@ class ProjectionUpdater:
         
         # Create subplots with 5 rows and 2 columns
         fig = make_subplots(rows=4, cols=3, subplot_titles=[
-            "Equity", "Real Estate", "Passive Income", "Debt",
+            "Equity", "Real Estate", "Commodity", "Debt",
             "Alternate Investments", "Good Liabilities to Total Assets", 
             "Bad Liabilities to Total Assets", "Expense to Income", 
             "Good Liability EMI to Income", "Bad Liability EMI to Income","Investment to Income","Final FBS Score"
@@ -18241,7 +19341,7 @@ class ProjectionUpdater:
         # Add traces for each column
         fig.add_trace(go.Scatter(x=fbs_df['entry_date'], y=fbs_df['equity'], mode='lines', name='Equity'), row=1, col=1)
         fig.add_trace(go.Scatter(x=fbs_df['entry_date'], y=fbs_df['real_estate'], mode='lines', name='Real Estate'), row=1, col=2)
-        fig.add_trace(go.Scatter(x=fbs_df['entry_date'], y=fbs_df['passive_income'], mode='lines', name='Passive Income'), row=1, col=3)
+        fig.add_trace(go.Scatter(x=fbs_df['entry_date'], y=fbs_df['commodity'], mode='lines', name='commodity'), row=1, col=3)
         fig.add_trace(go.Scatter(x=fbs_df['entry_date'], y=fbs_df['debt'], mode='lines', name='Debt'), row=2, col=1)
         fig.add_trace(go.Scatter(x=fbs_df['entry_date'], y=fbs_df['alternate_investments'], mode='lines', name='Alternate Investments'), row=2, col=2)
         fig.add_trace(go.Scatter(x=fbs_df['entry_date'], y=fbs_df['good_liabilities_to_total_assets'], mode='lines', name='Good Liabilities to Total Assets'), row=2, col=3)
@@ -18523,38 +19623,38 @@ class ProjectionUpdater:
 
         st.plotly_chart(fig)  
 
-    def plot_passive_income_line_graph(self, actual_df, ideal_df):
+    def plot_commodity_line_graph(self, actual_df, ideal_df):
         import plotly.express as px
         import plotly.graph_objects as go 
 
         # Multiply the equity column by 100 to convert it into percentage
-        actual_df['passive_income'] = actual_df['passive_income'] * 100
-        ideal_df['passive_income_assets'] = ideal_df['passive_income_assets'] * 100
+        actual_df['commodity'] = actual_df['commodity'] * 100
+        ideal_df['commodity'] = ideal_df['commodity'] * 100
 
          # Create a temporary DataFrame with renamed columns
-        ideal_df_temp = ideal_df.rename(columns={'passive_income_assets':'passive_income'})
+        ideal_df_temp = ideal_df.rename(columns={'commodity':'commodity'})
 
         # Merge actual and ideal projections based on entry_date
-        merged_df = pd.merge(actual_df[['entry_date', 'passive_income']], ideal_df_temp[['entry_date', 'passive_income']],
+        merged_df = pd.merge(actual_df[['entry_date', 'commodity']], ideal_df_temp[['entry_date', 'commodity']],
                             on='entry_date', suffixes=('_actual', '_ideal')).sort_values(by='entry_date')
 
         # Calculate the difference to identify intersections
-        merged_df['difference'] = merged_df['passive_income_actual'] - merged_df['passive_income_ideal']
+        merged_df['difference'] = merged_df['commodity_actual'] - merged_df['commodity_ideal']
         
         # Identify where the sign of the difference changes
         merged_df['sign_change'] = merged_df['difference'].apply(lambda x: 'positive' if x > 0 else 'negative')
         sign_change_index = merged_df[merged_df['sign_change'] != merged_df['sign_change'].shift(1)].index
 
         # Plotting the data
-        fig = px.line(merged_df, x='entry_date', y=['passive_income_actual', 'passive_income_ideal'],
-                    labels={'value': 'Passive Inocme (%)', 'entry_date': 'Date'},
-                    title='Passive Income Projection: Actual vs Ideal',
-                    color_discrete_map={'passive_income_actual': 'blue', 'passive_income_ideal': 'orange'})  # Specify colors here
+        fig = px.line(merged_df, x='entry_date', y=['commodity_actual', 'commodity_ideal'],
+                    labels={'value': 'Commodity (%)', 'entry_date': 'Date'},
+                    title='Commodity Projection: Actual vs Ideal',
+                    color_discrete_map={'commodity_actual': 'blue', 'commodity_ideal': 'orange'})  # Specify colors here
 
         # Adding markers for intersection points
         if not sign_change_index.empty:
             intersection_dates = merged_df.loc[sign_change_index, 'entry_date']
-            intersection_equities = merged_df.loc[sign_change_index, 'passive_income_actual']
+            intersection_equities = merged_df.loc[sign_change_index, 'commodity_actual']
             
             for date, equity in zip(intersection_dates, intersection_equities):
                 fig.add_annotation(
@@ -19059,7 +20159,7 @@ class ProjectionUpdater:
         # Plot the equity comparison line graph
         self.plot_equity_line_graph(actual_projections_df, ideal_max_milestone_metric_df)   
         self.plot_real_estate_line_graph(actual_projections_df, ideal_max_milestone_metric_df) 
-        self.plot_passive_income_line_graph(actual_projections_df , ideal_max_milestone_metric_df )
+        self.plot_commodity_line_graph(actual_projections_df , ideal_max_milestone_metric_df )
         self.plot_debt_line_graph(actual_projections_df, ideal_max_milestone_metric_df)
         self.plot_alternate_investments_line_graph(actual_projections_df, ideal_max_milestone_metric_df)
         self.plot_good_liabilities_to_total_assets_graph(actual_projections_df, ideal_max_milestone_metric_df)
@@ -19808,7 +20908,7 @@ class ProjectionUpdater:
     # Method to extract specific columns, transpose, and rename
     def transpose_income_selected_columns(self, dynamic_milestone_income_projection):
         # Check if required columns exist in the input DataFrame
-        required_columns = ['entry_date', 'age', 'gross_income', 'taxes', 'net_income_post_tax', 'total_expense' ]
+        required_columns = ['entry_date', 'age', 'active_income', 'passive_income','bonus_income','gross_income', 'taxes', 'net_income_post_tax', 'household_lifestyle_expense_amount', 'total_expense' ]
         for col in required_columns:
             if col not in dynamic_milestone_income_projection.columns:
                 raise KeyError(f"The column '{col}' does not exist in the input table.")
@@ -19830,7 +20930,7 @@ class ProjectionUpdater:
         transposed_df = transposed_df.fillna(0).astype(int)
         
         # Rename the index to the corresponding metrics for clarity
-        transposed_df.index = ['Age', 'Gross Income', '- Tax Expense', 'Net Income' , 'Total Expense']
+        transposed_df.index = ['Age', 'Active Income','Passive Income','Bonus Income','Gross Income', '- Tax Expense', 'Net Income' , 'Household Lifestyle Expenses', 'Total Expense']
 
         return transposed_df
     
@@ -20252,11 +21352,20 @@ class ProjectionUpdater:
 
         worksheet["A4"].value = "Income"
         worksheet["A4"].font = Font(bold=True)   
-        worksheet["A5"].font = Font(bold=False)
-        worksheet["A6"].font = Font(bold=False)
+        # Row-wise font styling (NO extra row insertion)
+        worksheet["A5"].font = Font(bold=False)   # Active Income
+        worksheet["A6"].font = Font(bold=False)   # Passive Income
+        worksheet["A7"].font = Font(bold=False)   # Bonus Income
+        worksheet["A8"].font = Font(bold=False)    # Gross Income
+        worksheet["A9"].font = Font(bold=False)   # - Tax Expense
+        worksheet["A10"].font = Font(bold=True)   # Net Income
 
-        worksheet.insert_rows(idx=8, amount=1)
-        
+
+        worksheet.insert_rows(idx=11, amount=1)
+        # Write Household Lifestyle Expenses header in the new row
+        worksheet["A12"].value = "Household Lifestyle Expenses"
+        worksheet["A12"].font = Font(bold=False)
+        worksheet["A12"].alignment = Alignment(horizontal='left')  
         
 
         # Define the keywords to look for and their replacements
@@ -20363,6 +21472,24 @@ class ProjectionUpdater:
 
 
     def run_download_milestones_excel(self, user_id):
+
+        cutoff_entry_date = st.date_input( "Download projections up to entry date", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="projection_cutoff_entry_date_1")
+        cutoff_entry_date = pd.to_datetime(cutoff_entry_date)
+
+        month_end_date = cutoff_entry_date + pd.offsets.MonthEnd(0)
+
+        if cutoff_entry_date != month_end_date:
+            st.warning(
+                f"""
+                ⚠️ Projections are calculated only on **month-end dates**.
+
+                You selected **{cutoff_entry_date.date()}**.
+                Using **{month_end_date.date()}** internally to avoid errors.
+                """
+            )
+
+            cutoff_entry_date = month_end_date 
+
         # Load the data for the user
         dynamic_income_projection_df = self.load_dynamic_income_projection_from_db()
         investment_projections_df = self.load_investment_projections_from_db(user_id)
@@ -20383,6 +21510,34 @@ class ProjectionUpdater:
         ideal_min_milestone_metric = self.load_ideal_min_milestone_metric_from_db(self.db_config)
         dynamic_ideal_projections_emergency_planning_df = self.load_dynamic_ideal_projections_emergency_planning_table_df_from_db(self.db_config)
         dynamic_fbs_projections_df = self.load_dynamic_fbs_projections_df_from_db(self.db_config)
+
+        def filter_by_entry_date(df, col="entry_date"):
+            if df is None or df.empty or col not in df.columns:
+                return df
+            df = df.copy()
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+            return df[df[col] <= cutoff_entry_date]
+
+        dynamic_income_projection_df =  filter_by_entry_date(dynamic_income_projection_df)
+        investment_projections_df =  filter_by_entry_date(investment_projections_df)
+        loan_repayment_projections_df =  filter_by_entry_date(loan_repayment_projections_df)
+        dynamic_liabilities_projections_df =  filter_by_entry_date(dynamic_liabilities_projections_df)
+        dynamic_liabilities_outflows_projections_df =  filter_by_entry_date(dynamic_liabilities_outflows_projections_df)
+        milestone_calculation_projections_df =  filter_by_entry_date(milestone_calculation_projections_df)
+        surplus_withdrawal_projections_df =  filter_by_entry_date(surplus_withdrawal_projections_df)
+        dynamic_assets_projections_df =  filter_by_entry_date(dynamic_assets_projections_df)
+        dynamic_milestone_income_projection =  filter_by_entry_date(dynamic_milestone_income_projection)
+        additional_income_expense_criteria_df =  filter_by_entry_date(additional_income_expense_criteria_df)
+        dynamic_yearly_cf_projections_df =  filter_by_entry_date(dynamic_yearly_cf_projections_df)
+        dynamic_actual_projections_df =  filter_by_entry_date(dynamic_actual_projections_df)
+        dynamic_ideal_projection_calculation =  filter_by_entry_date(dynamic_ideal_projection_calculation)
+        ideal_max_milestone_metric =  filter_by_entry_date(ideal_max_milestone_metric)
+        ideal_min_milestone_metric =  filter_by_entry_date(ideal_min_milestone_metric)
+        dynamic_ideal_projections_emergency_planning_df =  filter_by_entry_date(dynamic_ideal_projections_emergency_planning_df)
+        dynamic_fbs_projections_df =  filter_by_entry_date(dynamic_fbs_projections_df)
+        
+    
+
 
         # Fetch user name from database
         user_name = self.fetch_user_name(user_id)
@@ -20452,6 +21607,24 @@ class ProjectionUpdater:
                            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         
     def filter_run_download_milestones_with_liabilities_excel(self, user_id):
+
+        cutoff_entry_date = st.date_input( "Download projections up to entry date", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="projection_cutoff_entry_date")
+        cutoff_entry_date = pd.to_datetime(cutoff_entry_date)
+
+        month_end_date = cutoff_entry_date + pd.offsets.MonthEnd(0)
+
+        if cutoff_entry_date != month_end_date:
+            st.warning(
+                f"""
+                ⚠️ Projections are calculated only on **month-end dates**.
+
+                You selected **{cutoff_entry_date.date()}**.
+                Using **{month_end_date.date()}** internally to avoid errors.
+                """
+            )
+
+            cutoff_entry_date = month_end_date
+
         # Load the data for the user
         dynamic_income_projection_df = self.load_dynamic_income_projection_from_db()
         investment_projections_df = self.load_investment_projections_from_db(user_id)
@@ -20466,6 +21639,28 @@ class ProjectionUpdater:
         additional_income_expense_criteria_df = self.load_additional_income_expense_criteria_df_from_db()
         dynamic_yearly_cf_projections_df = self.load_dynamic_yearly_cf_projections_df_from_db()
         dynamic_fbs_projections_df = self.load_dynamic_fbs_projections_df_from_db(self.db_config)
+
+        def filter_by_entry_date(df, col="entry_date"):
+            if df is None or df.empty or col not in df.columns:
+                return df
+            df = df.copy()
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+            return df[df[col] <= cutoff_entry_date]
+        
+        dynamic_income_projection_df = filter_by_entry_date(dynamic_income_projection_df)
+        investment_projections_df = filter_by_entry_date(investment_projections_df)
+        loan_repayment_projections_df = filter_by_entry_date(loan_repayment_projections_df)
+        dynamic_liabilities_projections_df = filter_by_entry_date(dynamic_liabilities_projections_df)
+        dynamic_liabilities_outflows_projections_df = filter_by_entry_date(dynamic_liabilities_outflows_projections_df)
+        dynamic_insurance_outflows_projections_df = filter_by_entry_date(dynamic_insurance_outflows_projections_df)
+        milestone_calculation_projections_df = filter_by_entry_date(milestone_calculation_projections_df)
+        surplus_withdrawal_projections_df = filter_by_entry_date(surplus_withdrawal_projections_df)
+        dynamic_assets_projections_df = filter_by_entry_date(dynamic_assets_projections_df)
+        dynamic_milestone_income_projection = filter_by_entry_date(dynamic_milestone_income_projection)
+        additional_income_expense_criteria_df = filter_by_entry_date(additional_income_expense_criteria_df)
+        dynamic_yearly_cf_projections_df = filter_by_entry_date(dynamic_yearly_cf_projections_df)
+        dynamic_fbs_projections_df = filter_by_entry_date(dynamic_fbs_projections_df)
+
 
         # Fetch user name from database
         user_name = self.fetch_user_name(user_id)
@@ -20753,7 +21948,7 @@ class ProjectionUpdater:
         annual_projections_1 = annual_projections_1.sort_values(by='entry_date')
 
         additional_amount = st.number_input("Enter the additional amount to add to annual active income:", value=0)
-        stop_date = st.date_input("Enter the stop date up to which the additional amount is applied:", value=datetime.now())
+        stop_date = st.date_input("Enter the stop date up to which the additional amount is applied:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key = "key for act pas inc")
         stop_date = pd.to_datetime(stop_date)
 
         # Annual active income (+ add-on)
@@ -20772,8 +21967,8 @@ class ProjectionUpdater:
 
         # --- cutoff date JUST for bonus plotting (same idea you used for lifestyle extra expenses) ---
         stop_extra_date = st.date_input(
-            "Select the final date after which additional lifestyle expense categories should stop increasing:",
-            value=up_to_date, key='active passive stop date'
+            "Select the final date after which bonus amount should stop increasing:",
+            value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key='active passive stop date'
         )
         stop_extra_date = pd.to_datetime(stop_extra_date)
 
@@ -20809,6 +22004,7 @@ class ProjectionUpdater:
         if not annual_projections_1.empty:
             first_entry_date_annual_income = annual_projections_1['entry_date'].iloc[0]
             first_annual_income = annual_projections_1['annual_active_income'].iloc[0]
+            #st.write('first_annual_income',first_annual_income)
             formatted_first_total_income = self.format_amount(abs(first_annual_income))
             fig.add_annotation(
                 x=first_entry_date_annual_income,
@@ -20817,6 +22013,16 @@ class ProjectionUpdater:
                 showarrow=True,
                 arrowhead=2
             )
+
+        # --- Annual Bonus Income trace (rolling 12 mo sum, capped by stop_extra_date) ---
+        fig.add_trace(go.Scatter(
+            x=bonus_df['entry_date'],
+            y=bonus_df['annual_bonus_income_plot'],
+            mode='lines',
+            fill='tozeroy',
+            name='Annual Bonus Income',
+            line=dict(width=0.5, color='orange')
+        ))    
 
         # --- Annual Passive Income trace ---
         fig.add_trace(go.Scatter(
@@ -20832,7 +22038,9 @@ class ProjectionUpdater:
         first_nonzero_passive_income = annual_projections[annual_projections['annual_passive_income'] > 0]
         if not first_nonzero_passive_income.empty:
             first_entry_date_passive_income = first_nonzero_passive_income['entry_date'].iloc[0]
+            #st.write('first_entry_date_passive_income',first_entry_date_passive_income)
             first_annual_passive_income = first_nonzero_passive_income['annual_passive_income'].iloc[0]
+            #st.write('first_annual_passive_income',first_annual_passive_income)
             formatted_first_total_passive_income = self.format_amount(abs(first_annual_passive_income))
             fig.add_annotation(
                 x=first_entry_date_passive_income,
@@ -20842,15 +22050,7 @@ class ProjectionUpdater:
                 arrowhead=2
             )
 
-        # --- Annual Bonus Income trace (rolling 12 mo sum, capped by stop_extra_date) ---
-        fig.add_trace(go.Scatter(
-            x=bonus_df['entry_date'],
-            y=bonus_df['annual_bonus_income_plot'],
-            mode='lines',
-            fill='tozeroy',
-            name='Annual Bonus Income',
-            line=dict(width=0.5, color='orange')
-        ))
+        
 
         # ======================================================
         #   Y-AXIS TICKS (now must consider bonus too)
@@ -20964,13 +22164,13 @@ class ProjectionUpdater:
             mode='lines',
             fill='tozeroy',
             name='Annual Household Expense',
-            line=dict(width=0.5, color='#7f7f7f')
+            line=dict(width=0.5, color='#6c757d')
         ))
 
         # --- Stop Date ---
         stop_extra_date = st.date_input(
             "Select the final date after which additional lifestyle expense categories should stop increasing:",
-            value=up_to_date
+            value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key = 'key for exp plot'
         )
         stop_extra_date = pd.to_datetime(stop_extra_date)
 
@@ -21010,7 +22210,7 @@ class ProjectionUpdater:
         child1_colors = ['#1f77b4', '#2ca02c', '#17becf']  # blue/green/teal
         child2_colors = ['#ff7f0e', '#d62728', '#9467bd']  # orange/red/purple
         travel_colors = ['#8c564b', '#e377c2']  # brown/pink
-        other_colors = ['#7f7f7f', '#bcbd22', '#aec7e8', '#c5b0d5']
+        other_colors = ['#bcbd22', '#aec7e8', '#c5b0d5', '#ff9896']
 
         category_color_map = {}
         for i, cat in enumerate(child1_categories):
@@ -21021,6 +22221,7 @@ class ProjectionUpdater:
             category_color_map[cat] = travel_colors[i % len(travel_colors)]
         for i, cat in enumerate(other_categories):
             category_color_map[cat] = other_colors[i % len(other_colors)]
+            
 
         # --- Plot Dynamic Categories ---
         y_series_list = [annual_household_df['annual_household_expense'].abs()]
@@ -21035,6 +22236,7 @@ class ProjectionUpdater:
             cursor.close()
 
             df = pd.DataFrame(rows, columns=['entry_date', 'amount'])
+            #st.write('df', df)
             if df.empty:
                 continue
 
@@ -21122,14 +22324,6 @@ class ProjectionUpdater:
         )
 
         return fig
-
-
-
-
-
-
-
-
 
     
     def plot_liabilities_assets_networth(self, dynamic_yearly_cf_projections_df, up_to_date):
@@ -21468,7 +22662,7 @@ class ProjectionUpdater:
         # % to 0-100 scale
         actual_df['equity'] = actual_df['equity'] * 100
         actual_df['real_estate'] = actual_df['real_estate'] * 100
-        actual_df['passive_income'] = actual_df['passive_income'] * 100
+        actual_df['commodity'] = actual_df['commodity'] * 100
         actual_df['debt'] = actual_df['debt'] * 100
         actual_df['alternate_investments'] = actual_df['alternate_investments'] * 100
 
@@ -21491,8 +22685,8 @@ class ProjectionUpdater:
         ))
 
         fig.add_trace(go.Scatter(
-            x=actual_df['entry_date'], y=actual_df['passive_income'],
-            name='Passive Income', stackgroup='one', mode='none',
+            x=actual_df['entry_date'], y=actual_df['commodity'],
+            name='Commodity', stackgroup='one', mode='none',
             fillcolor='rgba(255,165,0,0.8)'
         ))
 
@@ -21938,9 +23132,9 @@ class ProjectionUpdater:
         investment_projections_df = self.load_investment_projections_from_db(user_id)
         investment_reshaped_updated_df = self.reshape_display_investment_projections(investment_projections_df, user_id)
         if entry_type == 'increment':
-            entry_date = st.date_input("Entry Date:", key="investment_increment_entry")
+            entry_date = st.date_input("Entry Date:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="investment_increment_entry")
             percentage = st.number_input("Increment percentage:", key="investment_increment_percentage")
-            end_date_increment = st.date_input("End Date for Increment:", key="investment_increment_end")
+            end_date_increment = st.date_input("End Date for Increment:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="investment_increment_end")
             asset_name = st.selectbox("Select asset name for increment:", investment_reshaped_updated_df.index.tolist(), key="investment_increment_asset")
 
             if st.button("Apply Increment Update", key="apply_investment_increment_update"):
@@ -21986,9 +23180,9 @@ class ProjectionUpdater:
         dynamic_loan_repayment_projections_df = self.load_dynamic_loan_repayment_projections_from_db(user_id)
         loan_repayment_reshaped_df = self.reshape_display_loan_repayment_projections(dynamic_loan_repayment_projections_df, user_id)
         if entry_type == 'increment':
-            entry_date = st.date_input("Entry Date:", key="loan_repayment_increment_entry")
+            entry_date = st.date_input("Entry Date:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="loan_repayment_increment_entry")
             percentage = st.number_input("Increment percentage:", key="loan_repayment_increment_percentage")
-            end_date_increment = st.date_input("End Date for Increment:", key="loan_repayment_increment_end")
+            end_date_increment = st.date_input("End Date for Increment:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="loan_repayment_increment_end")
             liability_name = st.selectbox("Select asset name for increment:", loan_repayment_reshaped_df.index.tolist(), key="loan_repayment_increment_liabilities")
 
             if st.button("Apply Increment Update", key="apply_loan_repayment_increment_update"):
@@ -22042,9 +23236,9 @@ class ProjectionUpdater:
         surplus_withdrawal_projections_df = self.load_surplus_withdrawal_projections_from_db(user_id)
         reshaped_updated_df = self.reshape_display_surplus_related_withdrawal_projections(surplus_withdrawal_projections_df, user_id)
         if entry_type == 'increment':
-            entry_date = st.date_input("Entry Date:", key="surplus_increment_entry")
+            entry_date = st.date_input("Entry Date:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="surplus_increment_entry")
             percentage = st.number_input("Increment percentage:", key="surplus_increment_percentage")
-            end_date_increment = st.date_input("End Date for Increment:", key="surplus_increment_end")
+            end_date_increment = st.date_input("End Date for Increment:", value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="surplus_increment_end")
             asset_name = st.selectbox("Select asset name for increment:", reshaped_updated_df.index.tolist(), key="surplus_increment_asset")
 
             if st.button("Apply Increment Update", key="apply_surplus_increment_update"):
@@ -22268,9 +23462,9 @@ class ProjectionUpdater:
         entry_type = st.radio("Choose entry type:", ('increment', 'stop'), key="surplus_entry_type")
 
         if entry_type == 'increment':
-            entry_date = st.date_input("Entry Date:", key="surplus_increment_entry")
+            entry_date = st.date_input("Entry Date:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="surplus_increment_entry")
             percentage = st.number_input("Increment percentage:", key="surplus_increment_percentage")
-            end_date_increment = st.date_input("End Date for Increment:", key="surplus_increment_end")
+            end_date_increment = st.date_input("End Date for Increment:",value=date.today(), min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), key="surplus_increment_end")
             asset_name = st.selectbox("Select asset name for increment:", reshaped_df['asset_name'], key="surplus_increment_asset")
 
             if st.button("Apply Increment Update", key="apply_surplus_increment_update"):
@@ -22362,7 +23556,122 @@ class ProjectionUpdater:
         projection_updater.plot_all_emergency_planning_charts(db_config, user_id) 
         projection_updater.save_and_plot_all_fbs_charts_comparison(db_config, user_id)
         
+
+    def format_indian_number(self, value):
+        """
+        Format number in Indian format with commas.
+        Rounded to nearest integer.
         
+        Examples:
+        10000000      -> 1,00,00,000
+        100000.6345   -> 1,00,001
+        -25768.16     -> -25,768
+        """
+        if value is None or pd.isna(value):
+            return ""
+
+        try:
+            value = float(value)
+        except Exception:
+            return value
+
+        # ✅ ROUND to nearest integer
+        value = int(round(value))
+
+        sign = "-" if value < 0 else ""
+        value = abs(value)
+
+        integer_str = str(value)
+
+        if len(integer_str) > 3:
+            last_three = integer_str[-3:]
+            remaining = integer_str[:-3]
+
+            remaining = ",".join(
+                [remaining[max(i - 2, 0):i] for i in range(len(remaining), 0, -2)][::-1]
+            )
+
+            formatted = remaining + "," + last_three
+        else:
+            formatted = integer_str
+
+        return f"{sign}{formatted}"
+
+
+    def fetch_active_queries(self):
+        query = """
+            SELECT
+                pid,
+                usename,
+                application_name,
+                client_addr,
+                state,
+                query_start,
+                NOW() - query_start AS duration,
+                query
+            FROM pg_stat_activity
+            WHERE state = 'active'
+            AND pid <> pg_backend_pid()
+            ORDER BY query_start;
+        """
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+                cols = [desc[0] for desc in cursor.description]
+            return pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            st.error(f"Failed to fetch pg_stat_activity: {e}")
+            return pd.DataFrame()   
+
+    def cancel_backend(self, pid: int):
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT pg_cancel_backend(%s);", (pid,))
+                cancelled = cursor.fetchone()[0]
+            self.connection.commit()
+            return cancelled
+        except Exception as e:
+            self.connection.rollback()
+            st.error(f"Failed to cancel PID {pid}: {e}")
+            return False     
+
+
+    def killed_pgsql_query(self):        
+        st.subheader("🛑 PostgreSQL Active Query Monitor")
+
+        if st.button("🔄 Refresh Active Queries"):
+            st.session_state["active_queries_df"] = self.fetch_active_queries()
+
+        active_df = st.session_state.get("active_queries_df", pd.DataFrame())
+
+        if active_df.empty:
+            st.info("No active queries found.")
+        else:
+            st.dataframe(active_df, use_container_width=True)
+
+            st.markdown("---")
+            st.subheader("🚫 Cancel Problematic Query")
+
+            pid_to_cancel = st.selectbox(
+                "Select PID to cancel",
+                options=active_df["pid"].tolist(),
+                format_func=lambda x: f"PID {x}"
+            )
+
+            confirm = st.checkbox("⚠️ I understand this will cancel the running query")
+
+            if st.button("❌ Cancel Selected Query"):
+                if not confirm:
+                    st.warning("Please confirm before cancelling.")
+                else:
+                    success = self.cancel_backend(pid_to_cancel)
+                    if success:
+                        st.success(f"✅ Query with PID {pid_to_cancel} cancelled successfully.")
+                        st.session_state["active_queries_df"] = self.fetch_active_queries()
+                    else:
+                        st.error("❌ Failed to cancel the query.")    
+   
          
 
 
@@ -22447,13 +23756,33 @@ if user_id:
         cursor.close()
         st.success("Initialization reset! The copy functions will run next time for this user.")
 
-    # Fetch user data (DOB, retirement age)
-    dob, retirement_age = projection_updater.fetch_user_data(user_id)
+    st.subheader("Re-copy Specific Milestone Table")
 
-	# Fetch user data (DOB, retirement age)
+    table_to_copy = st.selectbox(
+        "Select table to copy again",
+        [
+            "milestone customer profile",
+            "life stage growth milestone",
+            "milestone income",
+            "milestone customer details",
+            "milestone expenses",
+            "assets milestones",
+            "liabilities milestones",
+            "milestone insurance",
+            "milestone pmwell response"
+            
+        ],
+        key="manual_copy_table"
+    )
+
+    if st.button("Copy Selected Table"):
+        projection_updater.copy_single_milestone_table(user_id, table_to_copy)    
+
+    # Fetch user data (DOB, retirement age)
     dob, retirement_age = projection_updater.fetch_user_data(user_id)
     if dob is None or retirement_age is None:
         st.error("User profile data not found. Please check user_id or profile table.")
+
 
     if option == "Insert and update the milestone, Income, Assets and liability data":
 
@@ -22503,12 +23832,26 @@ if user_id:
         st.write("### Changing asset Category table")    
         manage_asset_category_table = st.radio("Do you want to update the Asset Category table?", ["No", "Yes"], index=0) 
         if manage_asset_category_table == "Yes":
-            projection_updater.manage_asset_category_table() 
+            projection_updater.manage_asset_category_table()
+
+        st.write("### Changing Insurance table")    
+        manage_Insurance_category_table = st.radio("Do you want to update the Insurance table?", ["No", "Yes"], index=0) 
+        if manage_Insurance_category_table == "Yes":
+            projection_updater.manage_milestone_insurance()
+
+        st.write("### Changing pmwell response table")    
+        manage_pmwell_response_category_table = st.radio("Do you want to update the pmwell response table?", ["No", "Yes"], index=0) 
+        if manage_pmwell_response_category_table == "Yes":
+            projection_updater.manage_milestone_pmwell_response()         
 
         st.write("### Changing Milestone Category table")    
         manage_milestone_category_table = st.radio("Do you want to update the Milestone Category table?", ["No", "Yes"], index=0) 
         if manage_milestone_category_table == "Yes":
             projection_updater.manage_milestones_category()
+
+        if st.button('display the goal table',key = 'goal table display 344'):
+            st.write("### User Milestones")
+            projection_updater.display_milestones_liabilities(user_id)      
 
         if st.button('Display milestone category table',key = 'milestone category 1'):
             st.write("### Milestone Category Name")
@@ -22519,7 +23862,7 @@ if user_id:
             projection_updater.display_asset_category_data(user_id)     
 
         if st.button('Display the customer profile (DOB and Retirement Age) table',key = 'customer profile table display 1'):
-            st.write("### User Assets")
+            st.write("### User DOB and Retirement Age")
             projection_updater.display_customer_profile_data(user_id)     
 
         if st.button('Display the asset table',key = 'asset table display 1'):
@@ -22534,7 +23877,6 @@ if user_id:
             st.write("### User income table")
             projection_updater.display_income_data(user_id)  
 
-
         if st.button('Display the customer details (Tax Deduction Amount and Non Taxable Income) table',key = 'customer details table display 1'):
             st.write("### User customer details (Tax Deduction Amount and Non Taxable Income) table")
             projection_updater.display_customer_details_data(user_id)  
@@ -22548,6 +23890,13 @@ if user_id:
             st.write("### User customer liabilities table")
             projection_updater.display_customer_liabilities_data(user_id) 
 
+        if st.button('Display the customer Insurance table',key = 'customer Insurnace table display 1'):
+            st.write("### User customer Insurance table")
+            projection_updater.display_milestone_insurance_data(user_id) 
+
+        if st.button('Display the pmwell response table',key = 'customer pmwell repsone table display 1'):
+            st.write("### User customer Insurance table")
+            projection_updater.display_pmwell_response_data(user_id)        
 
         st.write("### Changing Milestone Calculation Projection Data")
         manage_milestone_calculation_table = st.radio("Do you want to update the milestone calculation table?", ["No", "Yes"], index=0)
@@ -22621,11 +23970,12 @@ if user_id:
                 projection_updater.run_dynamic_insurance_outflows_projections(user_id, month_choice)
 
         try:
-            loan_repayment_df_updated = projection_updater.load_dynamic_loan_repayment_projections_from_db(user_id)
-            if loan_repayment_df_updated.empty:
+            dynamic_loan_repayment_projections_df = projection_updater.load_dynamic_loan_repayment_projections_from_db(user_id)
+            if dynamic_loan_repayment_projections_df.empty:
                 st.warning("⚠️ Loan repayment projections not yet calculated for this user.")
             else:
-                loan_repayment_reshaped_df = projection_updater.reshape_display_loan_repayment_projections(loan_repayment_df_updated, user_id)
+                st.write("### 🟢Loan repayment projectionss")
+                loan_repayment_reshaped_df = projection_updater.reshape_display_without_format_loan_repayment_projections(dynamic_loan_repayment_projections_df, user_id)
                 loan_repayment_editable_reshaped_df = st.data_editor(loan_repayment_reshaped_df, use_container_width=True, key = 'reshaped_editor_4')
                 # Save changes back to the database
                 if st.button("Save Changes", key = 'save transpose loan repayment projection'):
@@ -22634,12 +23984,15 @@ if user_id:
                     loan_repayment_updated_unpivoted_df = projection_updater.liabilities_unpivot_reshaped_data(loan_repayment_editable_reshaped_df)
 
                     # Update the main DataFrame with new values
-                    dynamic_loan_repayment_projections_df = projection_updater.liabilities_update_main_dataframe(loan_repayment_df_updated, loan_repayment_updated_unpivoted_df)
+                    dynamic_loan_repayment_projections_df = projection_updater.liabilities_update_main_dataframe(dynamic_loan_repayment_projections_df, loan_repayment_updated_unpivoted_df)
 
                     # Save the updated DataFrame to the database
                     projection_updater.save_dynamic_loan_repayment_projections_to_db(dynamic_loan_repayment_projections_df, user_id)
-
                     st.success("Changes of loan repayment projection saved successfully!")
+
+                st.write("### 🟢 Updated Loan repayment projectionss")
+                reshaped_loan_repayment_df = projection_updater.reshape_display_loan_repayment_projections(dynamic_loan_repayment_projections_df, user_id)
+                st.dataframe(reshaped_loan_repayment_df)    
                 
         except Exception as e:
             st.error(f"❌ Failed to load Loan Repayment Projections: {str(e)}")
@@ -22698,6 +24051,9 @@ if user_id:
         if manage_assets_projection_table == "Yes":
             if st.button("Update the Asset Projection", key = 'all asset outflows liabilities'):
                 projection_updater.run_dynamic_assets_projections(user_id, month_choice)
+                # Clear cached dataframe so fresh data loads from DB
+                st.session_state.pop(f"dynamic_assets_projections_df_{user_id}", None)
+                st.success("Assets projection updated successfully!")
 
         
         st.write("### Add Downpayment Data")
@@ -22710,7 +24066,7 @@ if user_id:
             if investment_df_updated.empty:
                 st.warning("⚠️ Investment projections not yet calculated for this user.")
             else:
-                investment_reshaped_df = projection_updater.reshape_display_investment_projections(investment_df_updated, user_id)
+                investment_reshaped_df = projection_updater.reshape_display_without_format_investment_projections(investment_df_updated, user_id)
                 st.write("### 🟢 Updated Investment Projections")
                 investment_editable_reshaped_df = st.data_editor(investment_reshaped_df, use_container_width=True, key = 'reshaped_editor_3')
 
@@ -22725,10 +24081,29 @@ if user_id:
 
                     # Save the updated DataFrame to the database
                     projection_updater.save_investment_projections_to_db(investment_df_updated, user_id)
+                    st.success("Changes saved successfully!") 
 
-            st.success("Changes of investment projection saved successfully!")
+                st.write("### 🟢 Updated Investment projections")
+                investment_df_updated = projection_updater.reshape_display_investment_projections(investment_df_updated, user_id)
+                st.dataframe(investment_df_updated)     
+
         except Exception as e:
             st.error(f"❌ Failed to load Investment Projections: {str(e)}")
+
+
+        if st.button("Update the Summary of all projections", key = 'all total of projections'):
+                projection_updater.run_dynamic_yearly_cf_projections(user_id, dob, retirement_age, month_choice) 
+
+        try:
+            dynamic_yearly_cf_projections_df = projection_updater.load_dynamic_yearly_cf_projections_df_from_db()
+            if dynamic_yearly_cf_projections_df.empty:
+                st.warning("⚠️ all cashflow summary projections not yet calculated for this user.")
+            else:
+                reshape_cashflow_summary_df = projection_updater.transpose_display_dynamic_yearly_cf_projections_1(dynamic_yearly_cf_projections_df)
+                st.write("### 🟢 Updated cashflow summary projections")
+                st.dataframe(reshape_cashflow_summary_df)
+        except Exception as e:
+            st.error(f"❌ Failed to load cashflow summary projections: {str(e)}")            
 
 
         try:
@@ -22736,7 +24111,7 @@ if user_id:
             if surplus_withdrawal_projections_df.empty:
                 st.warning("⚠️ Surplus withdrawal projections not yet calculated for this user.")
             else:
-                reshaped_surplus_withdrawal_df = projection_updater.reshape_display_surplus_related_withdrawal_projections(surplus_withdrawal_projections_df, user_id)
+                reshaped_surplus_withdrawal_df = projection_updater.reshape_display_without_format_surplus_related_withdrawal_projections(surplus_withdrawal_projections_df, user_id)
                 withdrawal_editable_reshaped_df = st.data_editor(reshaped_surplus_withdrawal_df, use_container_width=True, key = 'reshaped_editor_4')
                 # Save changes back to the database
                 if st.button("Save Changes", key = 'save transpose surplus projection'):
@@ -22753,7 +24128,10 @@ if user_id:
                     st.success("Changes saved successfully!") 
 
                 st.write("### 🟢 Updated surplus withdrawal projections")
-                st.dataframe(reshaped_surplus_withdrawal_df)
+                reshaped_surplus_withdrawal_df = projection_updater.reshape_display_surplus_related_withdrawal_projections(surplus_withdrawal_projections_df, user_id)
+                st.dataframe(reshaped_surplus_withdrawal_df) 
+
+                #st.dataframe(reshaped_surplus_withdrawal_df)
         except Exception as e:
             st.error(f"❌ Failed to load surplus withdrawal projections: {str(e)}") 
 
@@ -22893,7 +24271,12 @@ if user_id:
         
     elif option == "Update the Asset and liabilities table Manually":
         st.write("### Update the Asset and liabilities table Manually")
-        projection_updater.update_assets_and_liabilities_projections(user_id)             
+        projection_updater.update_assets_and_liabilities_projections(user_id)
+
+        delete_problematic_query = st.radio("Do you want to delete the unnecessary problematic query?", ["No", "Yes"], index=0)
+        if delete_problematic_query == "Yes":
+            st.write("### Delete the problematic query")
+            projection_updater.killed_pgsql_query()               
 
     elif option == "Display All Goal Planning Table":
         #st.write("### Calculating the FBS Projection")
@@ -22923,6 +24306,7 @@ if user_id:
 
 else:
     st.error("Please enter a valid user code.")          
+
 
 
 
