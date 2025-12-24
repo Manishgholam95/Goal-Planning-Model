@@ -116,7 +116,7 @@ def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="pl
     # Sharper PNG (higher DPI)
     chrome_opts.add_argument("--force-device-scale-factor=2")
 
-    service = Service(ChromeDriverManager().install())
+    service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=chrome_opts)
     try:
         driver.get("file://" + html_path)
@@ -24306,6 +24306,7 @@ if user_id:
 
 else:
     st.error("Please enter a valid user code.")          
+
 
 
 
