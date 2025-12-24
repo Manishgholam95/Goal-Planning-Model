@@ -100,7 +100,10 @@ def fig_to_png_via_selenium(fig, width=None, height=None, timeout=12, div_id="pl
     win_w = width + 240
     win_h = height + 280
 
-    html = pio.to_html(fig, include_plotlyjs="cdn", full_html=True, div_id=div_id)
+    html = pio.to_html(fig, include_plotlyjs="cdn", full_html=True, div_id=div_id, config={ "displayModeBar": False,   # 🔥 removes zoom / pan / camera icons
+																						   "staticPlot": False        # keeps full rendering but no UI
+                                                                                           })
+
 
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
         f.write(html)
@@ -24306,6 +24309,7 @@ if user_id:
 
 else:
     st.error("Please enter a valid user code.")          
+
 
 
 
